@@ -1,514 +1,697 @@
 /**
- * Win7 AI Coder — VSCode Extension
- * =================================
- * AI 编程助手扩展，在 VSCode 1.69 上运行，兼容 Windows 7
+ * Win7 AI Coder v3 — VSCode Extension with Codex-style Agent Loop
+ * =================================================================
  *
- * 架构：
- *   Webview (聊天UI) ← postMessage → Extension Host → HTTP → 本地 LLM API
+ * 架构:
+ *   Webview ← postMessage → Agent Loop → DeepSeek API (tool calling) → 读/写/搜文件
  *
- * 支持的模型后端：
- *   - OpenAI 兼容 API (llama.cpp server / vLLM / LocalAI / Ollama /v1)
- *   - Ollama 原生 API
+ * 支持的 DeepSeek 模型:
+ *   deepseek-chat       → V4 Flash (快速，代码场景推荐)
+ *   deepseek-reasoner   → R1 (深度推理)
+ *
+ * 兼容 VSCode 1.69 / Node 12.x (无可选链、无模板字符串)
  */
 
 const vscode = require('vscode');
 const http = require('http');
 const https = require('https');
 const url = require('url');
+const fs = require('fs');
+const path = require('path');
+const cp = require('child_process');
 
-// ─── 全局状态 ────────────────────────────────────────────
-let chatPanel = null;         // WebviewPanel instance
-let chatHistory = [];         // [{role, content}]
-let extensionContext = null;
+// ─── 全局 ─────────────────────────────────────────────
+var chatPanel = null;
+var chatHistory = [];
+var extensionContext = null;
+var workspaceRoot = '';
 
-// ─── System Prompt ───────────────────────────────────────
-const SYSTEM_PROMPT = `你是 Win7 AI Coder，一个集成在 VSCode 中的专业 AI 编程助手。
+// ─── 工具定义 (OpenAI function-calling 格式) ──────────
 
-规则:
-- 给出清晰、可直接运行的代码，用 \`\`\`语言
-代码块\`\`\` 标注
-- 解释关键思路和步骤
-- 如果用户粘贴了代码，指出具体问题并提出改进建议
-- 可以中英文混合表达，保证准确
-- 保持专业、有帮助的语气`;
+var TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'read_file',
+      description: 'Read the contents of a file. Returns the file content with line numbers.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Absolute or relative path to the file' }
+        },
+        required: ['path']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'write_file',
+      description: 'Create a new file or overwrite an existing file with the given content.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Path to write the file' },
+          content: { type: 'string', description: 'Full file content to write' }
+        },
+        required: ['path', 'content']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'list_dir',
+      description: 'List files and subdirectories in a directory.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Directory path (defaults to workspace root)' }
+        },
+        required: []
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'search_code',
+      description: 'Search for text or regex pattern in project files.',
+      parameters: {
+        type: 'object',
+        properties: {
+          pattern: { type: 'string', description: 'Text or regex pattern to search for' },
+          path: { type: 'string', description: 'Directory to search in (defaults to workspace)' },
+          file_glob: { type: 'string', description: 'Optional file glob filter, e.g. *.py' }
+        },
+        required: ['pattern']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'run_terminal',
+      description: 'Execute a shell command and return its output.',
+      parameters: {
+        type: 'object',
+        properties: {
+          command: { type: 'string', description: 'Shell command to run' },
+          cwd: { type: 'string', description: 'Working directory (defaults to workspace)' }
+        },
+        required: ['command']
+      }
+    }
+  }
+];
 
-// ─── 配置读取 ──────────────────────────────────────────
+var SYSTEM_PROMPT = (
+  'You are an AI coding assistant integrated into VSCode. You have access to tools that let you '
+  + 'read files, write files, search code, list directories, and run terminal commands.\n\n'
+  + 'Rules:\n'
+  + '- Proactively use tools to understand the codebase before answering.\n'
+  + '- When asked to implement a feature, use write_file to create or modify files.\n'
+  + '- When asked a question about code, use read_file or search_code first.\n'
+  + '- Run terminal commands (git status, npm install, pytest, etc.) when needed.\n'
+  + '- Give clear explanations of what you did and why.\n'
+  + '- Keep responses professional and helpful.'
+);
+
+// ─── 配置 ────────────────────────────────────────────
 
 function getConfig() {
-    const cfg = vscode.workspace.getConfiguration('win7-ai-coder');
-    const provider = cfg.get('provider', 'openai');
+  var cfg = vscode.workspace.getConfiguration('win7-ai-coder');
+  var provider = cfg.get('provider', 'openai');
+  var apiKey = cfg.get('openaiApiKey', 'not-needed');
+  var baseUrl = cfg.get('openaiBaseUrl', 'http://localhost:8080/v1');
+  var model = cfg.get('openaiModel', 'deepseek-chat');
 
-    if (provider === 'ollama') {
-        return {
-            provider: 'ollama',
-            apiUrl: cfg.get('ollamaBaseUrl', 'http://localhost:11434').replace(/\/+$/, '') + '/api/chat',
-            model: cfg.get('ollamaModel', 'deepseek-coder:6.7b'),
-            isOpenAI: false,
-            apiKey: '',
-        };
-    }
-
-    return {
-        provider: 'openai',
-        apiUrl: cfg.get('openaiBaseUrl', 'http://localhost:8080/v1').replace(/\/+$/, '') + '/chat/completions',
-        model: cfg.get('openaiModel', 'deepseek-coder'),
-        isOpenAI: true,
-        apiKey: cfg.get('openaiApiKey', 'not-needed'),
-    };
+  return {
+    provider: provider,
+    apiUrl: baseUrl.replace(/\/+$/, '') + '/chat/completions',
+    model: model,
+    apiKey: apiKey,
+    maxTokens: cfg.get('maxTokens', 8192),
+    temperature: cfg.get('temperature', 0.0),
+    streaming: cfg.get('enableStreaming', true),
+    maxToolRounds: 15
+  };
 }
 
-function getChatConfig() {
-    const cfg = vscode.workspace.getConfiguration('win7-ai-coder');
-    return {
-        maxTokens: cfg.get('maxTokens', 8192),
-        temperature: cfg.get('temperature', 0.15),
-        streaming: cfg.get('enableStreaming', true),
-    };
+// ─── 工具执行器 ──────────────────────────────────────
+
+function resolvePath(p) {
+  if (!p) return workspaceRoot || process.cwd();
+  if (p.startsWith('/') || /^[A-Za-z]:/.test(p)) return p;
+  var base = workspaceRoot || process.cwd();
+  return path.join(base, p);
 }
 
-// ─── LLM Stream API ────────────────────────────────────
-
-function streamChat(messages, onToken, onError, onDone) {
-    const modelCfg = getConfig();
-    const chatCfg = getChatConfig();
-    const parsed = url.parse(modelCfg.apiUrl);
-    const isHttps = parsed.protocol === 'https:';
-
-    const payload = modelCfg.isOpenAI
-        ? {
-            model: modelCfg.model,
-            messages: messages,
-            max_tokens: chatCfg.maxTokens,
-            temperature: chatCfg.temperature,
-            top_p: 0.95,
-            stream: true,
-          }
-        : {
-            model: modelCfg.model,
-            messages: messages,
-            stream: true,
-            options: {
-                temperature: chatCfg.temperature,
-                top_p: 0.95,
-                num_predict: chatCfg.maxTokens,
-            },
-          };
-
-    const body = JSON.stringify(payload);
-    const headers = {
-        'Content-Type': 'application/json',
-        'Accept': 'text/event-stream',
-    };
-    if (modelCfg.apiKey && modelCfg.apiKey !== 'not-needed') {
-        headers['Authorization'] = `Bearer ${modelCfg.apiKey}`;
+function executeTool(name, args, panel) {
+  var result;
+  try {
+    switch (name) {
+      case 'read_file':
+        result = toolReadFile(resolvePath(args.path || ''));
+        break;
+      case 'write_file':
+        result = toolWriteFile(resolvePath(args.path || ''), args.content || '');
+        break;
+      case 'list_dir':
+        result = toolListDir(resolvePath(args.path || workspaceRoot));
+        break;
+      case 'search_code':
+        result = toolSearchCode(args.pattern || '', resolvePath(args.path || workspaceRoot), args.file_glob || '');
+        break;
+      case 'run_terminal':
+        result = toolRunTerminal(args.command || '', resolvePath(args.cwd || workspaceRoot));
+        break;
+      default:
+        result = '[error] Unknown tool: ' + name;
     }
+  } catch (e) {
+    result = '[error] Tool execution failed: ' + (e.message || e.toString());
+  }
+  return result;
+}
 
-    const options = {
-        hostname: parsed.hostname,
-        port: parsed.port || (isHttps ? 443 : 80),
-        path: parsed.path,
-        method: 'POST',
-        headers: headers,
-        timeout: 180000,
-    };
+function toolReadFile(filePath) {
+  if (!fs.existsSync(filePath)) return '[error] File not found: ' + filePath;
+  var stat = fs.statSync(filePath);
+  if (stat.isDirectory()) return '[error] Path is a directory: ' + filePath;
+  if (stat.size > 500 * 1024) return '[error] File too large (' + (stat.size / 1024).toFixed(0) + ' KB)';
+  var content = fs.readFileSync(filePath, 'utf-8');
+  var lines = content.split('\n');
+  var out = '';
+  for (var i = 0; i < lines.length; i++) {
+    out += (i + 1) + '\t' + lines[i] + '\n';
+  }
+  return out;
+}
 
-    const transport = isHttps ? https : http;
-    const req = transport.request(options, (res) => {
-        if (res.statusCode !== 200) {
-            let errBody = '';
-            res.on('data', d => errBody += d);
-            res.on('end', () => {
-                let msg = 'HTTP ' + res.statusCode;
-                try {
-                    var parsed = JSON.parse(errBody);
-                    var em = (parsed.error && parsed.error.message) || '';
-                    if (em) msg = em;
-                } catch(e) {}
-                onError('**请求失败**\n\n状态码: ' + res.statusCode + '\n错误: ' + msg + '\n\n请确认:\n- 模型推理服务已启动\n- 地址: ' + modelCfg.apiUrl);
-            });
-            return;
-        }
+function toolWriteFile(filePath, content) {
+  var dir = path.dirname(filePath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(filePath, content, 'utf-8');
+  return '[ok] File written: ' + filePath + ' (' + content.length + ' chars)';
+}
 
-        let buffer = '';
-        res.on('data', (chunk) => {
-            buffer += chunk.toString();
-            const lines = buffer.split('\n');
-            buffer = lines.pop() || '';
+function toolListDir(dirPath) {
+  if (!fs.existsSync(dirPath)) return '[error] Directory not found: ' + dirPath;
+  var entries = fs.readdirSync(dirPath);
+  var out = 'Directory: ' + dirPath + '\n\n';
+  var dirs = [];
+  var files = [];
+  for (var i = 0; i < entries.length; i++) {
+    var name = entries[i];
+    if (name.startsWith('.')) continue;
+    var full = path.join(dirPath, name);
+    try {
+      var st = fs.statSync(full);
+      if (st.isDirectory()) {
+        dirs.push('  [DIR]  ' + name + '/');
+      } else {
+        var sz = st.size > 1024 ? (st.size / 1024).toFixed(1) + 'K' : st.size + 'B';
+        files.push('  [FILE] ' + name + '  (' + sz + ')');
+      }
+    } catch(e) {}
+  }
+  out += dirs.join('\n') + '\n' + files.join('\n');
+  if (out.length > 4000) out = out.substring(0, 4000) + '\n... (truncated)';
+  return out;
+}
 
-            for (const line of lines) {
-                const trimmed = line.trim();
-                if (!trimmed) continue;
+function toolSearchCode(pattern, dirPath, fileGlob) {
+  if (!fs.existsSync(dirPath)) return '[error] Directory not found: ' + dirPath;
+  var results = [];
+  var excludeDirs = { '.git':1, 'node_modules':1, '__pycache__':1, '.hg':1, '.svn':1,
+                      'venv':1, '.venv':1, 'env':1, 'dist':1, 'build':1, '.idea':1, '.vscode':1 };
+  var excludeExts = { '.png':1, '.jpg':1, '.gif':1, '.zip':1, '.tar':1, '.gz':1,
+                      '.exe':1, '.dll':1, '.so':1, '.pyc':1, '.bin':1, '.pdf':1 };
 
-                if (modelCfg.isOpenAI) {
-                    if (!trimmed.startsWith('data: ')) continue;
-                    const data = trimmed.slice(6).trim();
-                    if (data === '[DONE]') {
-                        return onDone();
-                    }
-                    try {
-                        const json = JSON.parse(data);
-                        var choices = json.choices;
-                        var delta = (choices && choices.length && choices[0]) ? choices[0].delta : null;
-                        if (delta && delta.content) {
-                            onToken(delta.content);
-                        }
-                    } catch(e) {}
-                } else {
-                    try {
-                        const json = JSON.parse(trimmed);
-                        if (json.done) return onDone();
-                        var msg = json.message;
-                        if (msg && msg.content) {
-                            onToken(msg.content);
-                        }
-                    } catch(e) {}
+  function walk(dir) {
+    if (results.length >= 100) return;
+    try {
+      var items = fs.readdirSync(dir);
+      for (var i = 0; i < items.length; i++) {
+        if (results.length >= 100) return;
+        var name = items[i];
+        if (name.startsWith('.')) continue;
+        var full = path.join(dir, name);
+        try {
+          var st = fs.statSync(full);
+          if (st.isDirectory()) {
+            if (!excludeDirs[name]) walk(full);
+          } else {
+            var ext = path.extname(name).toLowerCase();
+            if (excludeExts[ext]) continue;
+            if (fileGlob && !matchGlob(name, fileGlob)) continue;
+            if (st.size > 200 * 1024) continue;
+            try {
+              var content = fs.readFileSync(full, 'utf-8');
+              var lines = content.split('\n');
+              for (var j = 0; j < lines.length; j++) {
+                if (lines[j].toLowerCase().indexOf(pattern.toLowerCase()) >= 0) {
+                  results.push(full + ':' + (j + 1) + '  ' + lines[j].trim().substring(0, 150));
+                  if (results.length >= 100) return;
                 }
-            }
-        });
-
-        res.on('end', () => {
-            // process remaining buffer
-            if (buffer.trim()) {
-                try {
-                    if (modelCfg.isOpenAI && buffer.startsWith('data: ')) {
-                        const data = buffer.slice(6).trim();
-                        if (data !== '[DONE]') {
-                            const json = JSON.parse(data);
-                            var choices2 = json.choices;
-                            var delta2 = (choices2 && choices2.length && choices2[0]) ? choices2[0].delta : null;
-                            if (delta2 && delta2.content) onToken(delta2.content);
-                        }
-                    }
-                } catch(e) {}
-            }
-            onDone();
-        });
-
-        res.on('error', (e) => {
-            onError(`**连接错误**\n\n\`${e.message}\`\n\n请检查模型服务是否正常运行。`);
-        });
-    });
-
-    req.on('error', (e) => {
-        onError(`**无法连接到模型服务**\n\n\`${e.message}\`\n\n请确认:\n- 模型服务已启动\n- 地址正确: \`${modelCfg.apiUrl}\``);
-    });
-
-    req.on('timeout', () => {
-        req.destroy();
-        onError('**请求超时**\n\n模型响应超过 180 秒，请检查模型服务。');
-    });
-
-    req.write(body);
-    req.end();
+              }
+            } catch(e2) {}
+          }
+        } catch(e3) {}
+      }
+    } catch(e4) {}
+  }
+  walk(dirPath);
+  if (results.length === 0) return 'No matches found for "' + pattern + '"';
+  return 'Found ' + results.length + ' matches:\n\n' + results.join('\n');
 }
 
-// ─── Webview HTML 生成 ─────────────────────────────────
+function matchGlob(name, glob) {
+  var re = '^' + glob.replace(/\./g, '\\.').replace(/\*/g, '.*') + '$';
+  return new RegExp(re, 'i').test(name);
+}
+
+function toolRunTerminal(command, cwd) {
+  var dir = cwd || workspaceRoot || process.cwd();
+  try {
+    var out = cp.execSync(command, { cwd: dir, timeout: 30000, encoding: 'utf-8', maxBuffer: 500 * 1024 });
+    var output = out.toString().trim();
+    if (output.length > 3000) output = output.substring(0, 3000) + '\n... (truncated)';
+    return '[exit 0]\n' + output;
+  } catch (e) {
+    var errOut = e.stdout ? e.stdout.toString().trim().substring(0, 1000) : '';
+    var errMsg = e.stderr ? e.stderr.toString().trim().substring(0, 1000) : '';
+    return '[exit ' + (e.status || 1) + ']\n' + (errOut || errMsg || e.message);
+  }
+}
+
+// ─── Agent Loop ──────────────────────────────────────
+
+function agentLoop(panel, userText) {
+  // Initialize
+  if (chatHistory.length === 0) {
+    chatHistory.push({ role: 'system', content: SYSTEM_PROMPT });
+  }
+  chatHistory.push({ role: 'user', content: userText });
+
+  panel.webview.postMessage({ type: 'agent-start' });
+  runLoop(panel, 0);
+}
+
+function runLoop(panel, round) {
+  var cfg = getConfig();
+  if (round >= cfg.maxToolRounds) {
+    // Force stop
+    panel.webview.postMessage({ type: 'error', content: '已超过最大工具轮数 (' + cfg.maxToolRounds + ')，请重述你的问题。' });
+    panel.webview.postMessage({ type: 'agent-end' });
+    return;
+  }
+
+  var payload = {
+    model: cfg.model,
+    messages: chatHistory,
+    max_tokens: cfg.maxTokens,
+    temperature: cfg.temperature,
+    top_p: 0.95,
+    stream: false,       // Agent loop uses non-streaming for tool detection
+    tools: TOOLS,
+    tool_choice: 'auto'
+  };
+
+  var body = JSON.stringify(payload);
+  var parsed = url.parse(cfg.apiUrl);
+  var isHttps = parsed.protocol === 'https:';
+
+  var headers = {
+    'Content-Type': 'application/json',
+    'Content-Length': Buffer.byteLength(body, 'utf-8')
+  };
+  if (cfg.apiKey && cfg.apiKey !== 'not-needed') {
+    headers['Authorization'] = 'Bearer ' + cfg.apiKey;
+  }
+
+  var options = {
+    hostname: parsed.hostname,
+    port: parsed.port || (isHttps ? 443 : 80),
+    path: parsed.path,
+    method: 'POST',
+    headers: headers,
+    timeout: 180000
+  };
+
+  var transport = isHttps ? https : http;
+  var req = transport.request(options, function(res) {
+    var responseBody = '';
+    res.on('data', function(d) { responseBody += d; });
+    res.on('end', function() {
+      if (res.statusCode !== 200) {
+        var errMsg = 'HTTP ' + res.statusCode;
+        try {
+          var ej = JSON.parse(responseBody);
+          var em = (ej.error && ej.error.message) || '';
+          if (em) errMsg = em;
+        } catch(e) {}
+        chatHistory.pop(); // Remove the failed user message
+        panel.webview.postMessage({ type: 'error', content: errMsg });
+        panel.webview.postMessage({ type: 'agent-end' });
+        return;
+      }
+
+      try {
+        var data = JSON.parse(responseBody);
+      } catch(e) {
+        panel.webview.postMessage({ type: 'error', content: 'JSON parse error from API' });
+        panel.webview.postMessage({ type: 'agent-end' });
+        return;
+      }
+
+      var msg = data.choices && data.choices[0] ? data.choices[0].message : null;
+      if (!msg) {
+        panel.webview.postMessage({ type: 'error', content: 'API returned empty response' });
+        panel.webview.postMessage({ type: 'agent-end' });
+        return;
+      }
+
+      // Check for tool calls
+      var toolCalls = msg.tool_calls;
+      if (toolCalls && toolCalls.length > 0) {
+        // Add assistant message with tool calls
+        var assistantMsg = { role: 'assistant', content: msg.content || null };
+        assistantMsg.tool_calls = toolCalls;
+        chatHistory.push(assistantMsg);
+
+        // Execute all tools sequentially
+        var toolsToRun = toolCalls.slice(); // copy
+        executeToolsSequentially(panel, toolsToRun, 0, function() {
+          runLoop(panel, round + 1);
+        });
+        return;
+      }
+
+      // Text response — stream it
+      chatHistory.push({ role: 'assistant', content: msg.content || '' });
+      panel.webview.postMessage({ type: 'assistant', content: msg.content || '' });
+      panel.webview.postMessage({ type: 'agent-end' });
+    });
+  });
+
+  req.on('error', function(e) {
+    panel.webview.postMessage({ type: 'error', content: 'Connection error: ' + e.message });
+    panel.webview.postMessage({ type: 'agent-end' });
+  });
+  req.write(body);
+  req.end();
+}
+
+function executeToolsSequentially(panel, toolCalls, index, done) {
+  if (index >= toolCalls.length) {
+    done();
+    return;
+  }
+
+  var tc = toolCalls[index];
+  var fn = tc.function;
+  var name = fn.name;
+  var args = {};
+  try {
+    args = JSON.parse(fn.arguments);
+  } catch(e) {
+    args = {};
+  }
+
+  // Notify webview
+  var preview = name + ' ' + JSON.stringify(args).substring(0, 80);
+  panel.webview.postMessage({ type: 'tool-start', name: name, args: args, preview: preview });
+
+  // Execute
+  var result = executeTool(name, args, panel);
+
+  // Notify webview
+  panel.webview.postMessage({ type: 'tool-end', name: name, result: result.substring(0, 500) });
+
+  // Add tool result to history
+  chatHistory.push({
+    role: 'tool',
+    tool_call_id: tc.id,
+    content: result
+  });
+
+  // Small delay before next tool
+  setTimeout(function() {
+    executeToolsSequentially(panel, toolCalls, index + 1, done);
+  }, 100);
+}
+
+// ─── Webview HTML ────────────────────────────────────
 
 function getWebviewHTML(webview) {
-    const styleUri = webview.asWebviewUri(
-        vscode.Uri.joinPath(extensionContext.extensionUri, 'media', 'chat.css')
-    );
-    const scriptUri = webview.asWebviewUri(
-        vscode.Uri.joinPath(extensionContext.extensionUri, 'media', 'chat.js')
-    );
-    const codemirrorCss = webview.asWebviewUri(
-        vscode.Uri.joinPath(extensionContext.extensionUri, 'media', 'codemirror.css')
-    );
-    const hljsCss = webview.asWebviewUri(
-        vscode.Uri.joinPath(extensionContext.extensionUri, 'media', 'highlight.css')
-    );
+  var cssUri = webview.asWebviewUri(
+    vscode.Uri.joinPath(extensionContext.extensionUri, 'media', 'chat.css')
+  );
+  var jsUri = webview.asWebviewUri(
+    vscode.Uri.joinPath(extensionContext.extensionUri, 'media', 'chat.js')
+  );
 
-    return `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<meta http-equiv="Content-Security-Policy"
-      content="default-src 'none';
-               style-src ${webview.cspSource} 'unsafe-inline';
-               script-src ${webview.cspSource} 'unsafe-inline';
-               font-src ${webview.cspSource};
-               img-src ${webview.cspSource} data:;">
-<link rel="stylesheet" href="${styleUri}">
-<link rel="stylesheet" href="${codemirrorCss}">
-<link rel="stylesheet" href="${hljsCss}">
-<title>AI Chat</title>
-</head>
-<body>
-  <div id="container">
-    <!-- Header -->
-    <div id="header">
-      <span class="header-title">🤖 AI Chat</span>
-      <div class="header-actions">
-        <button id="btn-clear" class="icon-btn" title="清空对话">🗑️</button>
-        <button id="btn-config" class="icon-btn" title="配置">⚙️</button>
-      </div>
-    </div>
-
-    <!-- Messages -->
-    <div id="messages">
-      <div class="welcome">
-        <div class="welcome-icon">🤖</div>
-        <div class="welcome-title">Win7 AI Coder</div>
-        <div class="welcome-sub">本地 DeepSeek 编程助手</div>
-        <div class="welcome-hints">
-          <div class="hint"><span class="hint-key">打开文件</span> 后提问，AI 能直接分析代码</div>
-          <div class="hint"><span class="hint-key">选中代码</span> 右键 → Ask AI</div>
-          <div class="hint"><span class="hint-key">Ctrl+Shift+P</span> → AI Chat: Explain Code</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Input -->
-    <div id="input-area">
-      <div id="context-bar" style="display:none;">
-        <span id="context-label"></span>
-        <button id="btn-remove-context" class="small-btn">&times;</button>
-      </div>
-      <div id="input-row">
-        <textarea id="input" rows="2" placeholder="输入编程问题… (Enter 发送, Shift+Enter 换行)"></textarea>
-        <button id="btn-send" class="send-btn" disabled>▶</button>
-      </div>
-    </div>
-
-    <!-- Typing indicator (hidden by default) -->
-    <div id="typing" style="display:none;">
-      <span class="dot"></span><span class="dot"></span><span class="dot"></span>
-    </div>
-  </div>
-  <script src="${scriptUri}"></script>
-</body>
-</html>`;
+  return '<!DOCTYPE html>\n' +
+'<html lang="zh-CN">\n' +
+'<head>\n' +
+'<meta charset="UTF-8">\n' +
+'<meta http-equiv="Content-Security-Policy"\n' +
+'      content="default-src \'none\';\n' +
+'               style-src ' + webview.cspSource + ' \'unsafe-inline\';\n' +
+'               script-src ' + webview.cspSource + ' \'unsafe-inline\';">\n' +
+'<link rel="stylesheet" href="' + cssUri + '">\n' +
+'<title>AI Agent</title>\n' +
+'</head>\n' +
+'<body>\n' +
+'  <div id="container">\n' +
+'    <div id="header">\n' +
+'      <span class="header-title">\u{1F916} AI Agent</span>\n' +
+'      <div class="header-actions">\n' +
+'        <button id="btn-clear" class="icon-btn" title="清除">\u{1F5D1}</button>\n' +
+'        <button id="btn-config" class="icon-btn" title="附加文件">\u{1F4CE}</button>\n' +
+'      </div>\n' +
+'    </div>\n' +
+'    <div id="messages">\n' +
+'      <div class="welcome">\n' +
+'        <div class="welcome-icon">\u{1F916}</div>\n' +
+'        <div class="welcome-title">Win7 AI Coder v3</div>\n' +
+'        <div class="welcome-sub">Agent mode — 读项目 \u2192 分析 \u2192 创建文件 \u2192 写代码</div>\n' +
+'        <div class="welcome-hints">\n' +
+'          <div class="hint"><span class="hint-key">\u{1F4C2}</span> 加载工程后直接说\"帮我做一个xxx\"</div>\n' +
+'          <div class="hint"><span class="hint-key">\u{1F527}</span> AI 会自动读代码、创建文件、执行命令</div>\n' +
+'          <div class="hint"><span class="hint-key">\u231B</span> 左侧观察工具调用过程</div>\n' +
+'        </div>\n' +
+'      </div>\n' +
+'    </div>\n' +
+'    <div id="input-area">\n' +
+'      <div id="context-bar" style="display:none;">\n' +
+'        <span id="context-label"></span>\n' +
+'        <button id="btn-remove-context" class="small-btn">&times;</button>\n' +
+'      </div>\n' +
+'      <div id="input-row">\n' +
+'        <textarea id="input" rows="2" placeholder="告诉我你要做什么，我来读项目、写代码... (Enter 发送)"></textarea>\n' +
+'        <button id="btn-send" class="send-btn" disabled>\u25B6</button>\n' +
+'      </div>\n' +
+'    </div>\n' +
+'  </div>\n' +
+'  <script src="' + jsUri + '"></script>\n' +
+'</body>\n' +
+'</html>';
 }
 
-// ─── Webview 消息处理 ──────────────────────────────────
+// ─── Webview 消息分发 ────────────────────────────────
 
 function handleWebviewMessage(panel, message) {
-    switch (message.type) {
-        case 'chat':
-            handleChat(panel, message);
-            break;
-        case 'clear':
-            chatHistory = [];
-            panel.webview.postMessage({ type: 'cleared' });
-            break;
-        case 'ready':
-            // webview is ready, send config
-            const cfg = getConfig();
-            panel.webview.postMessage({
-                type: 'config',
-                model: cfg.model,
-                provider: cfg.provider,
-            });
-            break;
-        case 'attachFile':
-            attachCurrentFile(panel);
-            break;
-    }
+  switch (message.type) {
+    case 'chat':
+      handleChat(panel, message);
+      break;
+    case 'clear':
+      chatHistory = [];
+      panel.webview.postMessage({ type: 'cleared' });
+      break;
+    case 'ready':
+      var cfg = getConfig();
+      panel.webview.postMessage({
+        type: 'config',
+        model: cfg.model,
+        ws: workspaceRoot || '(无工作区)'
+      });
+      break;
+    case 'attachFile':
+      attachCurrentFile(panel);
+      break;
+  }
 }
 
 function handleChat(panel, message) {
-    const text = message.text || '';
-    if (!text.trim()) return;
+  var text = (message.text || '').trim();
+  if (!text) return;
 
-    // Build context
-    const fileCtx = message.fileContext || '';
-    const selCtx = message.selection || '';
+  // Attach workspace info if first message
+  if (chatHistory.length === 0 && workspaceRoot) {
+    text = '[Workspace: ' + workspaceRoot + ']\n\n' + text;
+  }
 
-    let userMsg = text;
-    const ctxParts = [];
-    if (selCtx) ctxParts.push(`用户选中的代码:\n\`\`\`\n${selCtx}\n\`\`\``);
-    if (fileCtx) ctxParts.push(`当前文件内容:\n\`\`\`\n${fileCtx}\n\`\`\``);
-    if (ctxParts.length) {
-        userMsg = ctxParts.join('\n\n') + '\n\n' + text;
-    }
+  // Attach file context
+  if (message.fileContext) {
+    text = 'Context file:\n```\n' + message.fileContext + '\n```\n\nUser request:\n' + text;
+  }
 
-    // Init history
-    if (chatHistory.length === 0) {
-        chatHistory.push({ role: 'system', content: SYSTEM_PROMPT });
-    }
-    chatHistory.push({ role: 'user', content: userMsg });
+  // Show user message
+  panel.webview.postMessage({ type: 'user', content: text.substring(0, 500) });
 
-    // Notify webview
-    panel.webview.postMessage({ type: 'streamStart' });
-
-    let fullResponse = '';
-
-    streamChat(
-        chatHistory,
-        // onToken
-        (token) => {
-            fullResponse += token;
-            panel.webview.postMessage({ type: 'token', content: token });
-        },
-        // onError
-        (errMsg) => {
-            panel.webview.postMessage({ type: 'error', content: errMsg });
-        },
-        // onDone
-        () => {
-            if (fullResponse.trim()) {
-                chatHistory.push({ role: 'assistant', content: fullResponse });
-            }
-            panel.webview.postMessage({ type: 'streamEnd' });
-        }
-    );
+  agentLoop(panel, text);
 }
 
-async function attachCurrentFile(panel) {
-    const editor = vscode.window.activeTextEditor;
-    if (!editor) {
-        panel.webview.postMessage({ type: 'status', text: '没有打开的文件' });
-        return;
-    }
-    const doc = editor.document;
-    const sel = editor.selection;
-    const hasSelection = !sel.isEmpty;
-    const content = hasSelection
-        ? doc.getText(sel)
-        : doc.getText();
-    const label = hasSelection
-        ? `已选中: ${doc.fileName.split(/[/\\]/).pop()} (${content.split('\n').length} 行)`
-        : `已附加: ${doc.fileName.split(/[/\\]/).pop()}`;
+function attachCurrentFile(panel) {
+  var editor = vscode.window.activeTextEditor;
+  if (!editor) {
+    panel.webview.postMessage({ type: 'status', text: '没有打开的文件' });
+    return;
+  }
+  var doc = editor.document;
+  var sel = editor.selection;
+  var hasSel = !sel.isEmpty;
+  var content = hasSel ? doc.getText(sel) : doc.getText();
+  var lbl = hasSel
+    ? '已选中: ' + doc.fileName.split(/[/\\]/).pop() + ' (' + content.split('\n').length + ' 行)'
+    : '已附加: ' + doc.fileName.split(/[/\\]/).pop();
 
-    panel.webview.postMessage({
-        type: 'contextSet',
-        fileContent: content,
-        selection: hasSelection ? content : '',
-        label: label,
-    });
+  panel.webview.postMessage({
+    type: 'contextSet',
+    fileContent: content,
+    label: lbl
+  });
 }
 
-// ─── 扩展激活 ──────────────────────────────────────────
+// ─── VSCode 激活 ─────────────────────────────────────
 
 function activate(context) {
-    extensionContext = context;
-    console.log('Win7 AI Coder activated');
+  extensionContext = context;
+  console.log('Win7 AI Coder v3 (Agent Mode) activated');
 
-    // 注册命令: 打开聊天面板
-    context.subscriptions.push(
-        vscode.commands.registerCommand('win7-ai-coder.openChat', () => {
-            openChatPanel(context);
-        })
-    );
+  // Detect workspace
+  if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
+    workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
+  }
 
-    // 注册命令: 询问选中代码
-    context.subscriptions.push(
-        vscode.commands.registerCommand('win7-ai-coder.askSelection', async () => {
-            const panel = openChatPanel(context);
-            const editor = vscode.window.activeTextEditor;
-            if (!editor || editor.selection.isEmpty) {
-                vscode.window.showWarningMessage('请先选中代码再使用此功能。');
-                return;
-            }
-            const sel = editor.document.getText(editor.selection);
-            panel.webview.postMessage({
-                type: 'contextSet',
-                fileContent: sel,
-                selection: sel,
-                label: `已选中: ${editor.document.fileName.split(/[/\\]/).pop()} (${sel.split('\n').length} 行)`,
-            });
-        })
-    );
+  // Commands
+  context.subscriptions.push(
+    vscode.commands.registerCommand('win7-ai-coder.openChat', function() {
+      openChatPanel(context);
+    })
+  );
 
-    // 注册命令: 解释当前文件
-    context.subscriptions.push(
-        vscode.commands.registerCommand('win7-ai-coder.explainCode', async () => {
-            const panel = openChatPanel(context);
-            await attachCurrentFile(panel);
-            // Auto-send explain request
-            const editor = vscode.window.activeTextEditor;
-            if (editor) {
-                const doc = editor.document;
-                const lang = doc.languageId || 'text';
-                handleChat(panel, {
-                    text: `请详细解释这个 ${lang} 文件的代码结构和功能。`,
-                    fileContext: doc.getText(),
-                });
-            }
-        })
-    );
+  context.subscriptions.push(
+    vscode.commands.registerCommand('win7-ai-coder.askSelection', function() {
+      var panel = openChatPanel(context);
+      var editor = vscode.window.activeTextEditor;
+      if (!editor || editor.selection.isEmpty) {
+        vscode.window.showWarningMessage('请先选中代码。');
+        return;
+      }
+      var sel = editor.document.getText(editor.selection);
+      panel.webview.postMessage({
+        type: 'contextSet',
+        fileContent: sel,
+        label: '已选中: ' + editor.document.fileName.split(/[/\\]/).pop()
+      });
+    })
+  );
 
-    // 注册命令: 生成文档
-    context.subscriptions.push(
-        vscode.commands.registerCommand('win7-ai-coder.generateDocs', async () => {
-            const panel = openChatPanel(context);
-            await attachCurrentFile(panel);
-            const editor = vscode.window.activeTextEditor;
-            if (editor) {
-                const doc = editor.document;
-                const lang = doc.languageId || 'text';
-                handleChat(panel, {
-                    text: `请为这段 ${lang} 代码生成完整的文档注释，包括参数说明、返回值、使用示例。`,
-                    fileContext: doc.getText(),
-                });
-            }
-        })
-    );
+  context.subscriptions.push(
+    vscode.commands.registerCommand('win7-ai-coder.explainCode', function() {
+      var panel = openChatPanel(context);
+      var editor = vscode.window.activeTextEditor;
+      if (!editor) return;
+      var content = editor.document.getText();
+      var lang = editor.document.languageId || 'code';
+      panel.webview.postMessage({
+        type: 'contextSet',
+        fileContent: content,
+        label: '剖析: ' + editor.document.fileName.split(/[/\\]/).pop()
+      });
+      handleChat(panel, {
+        text: '请详细分析项目结构，解释每个文件的作用和它们之间的关系。',
+        fileContext: content
+      });
+    })
+  );
 
-    // 注册命令: 清空对话
-    context.subscriptions.push(
-        vscode.commands.registerCommand('win7-ai-coder.clearChat', () => {
-            chatHistory = [];
-            if (chatPanel) {
-                chatPanel.webview.postMessage({ type: 'cleared' });
-            }
-        })
-    );
+  context.subscriptions.push(
+    vscode.commands.registerCommand('win7-ai-coder.clearChat', function() {
+      chatHistory = [];
+      if (chatPanel) chatPanel.webview.postMessage({ type: 'cleared' });
+    })
+  );
 
-    // 注册 Webview View Provider（侧栏视图）
-    context.subscriptions.push(
-        vscode.window.registerWebviewViewProvider('win7-ai-coder.chatView', {
-            resolveWebviewView(webviewView) {
-                webviewView.webview.options = {
-                    enableScripts: true,
-                    localResourceRoots: [
-                        vscode.Uri.joinPath(context.extensionUri, 'media'),
-                    ],
-                };
-                webviewView.webview.html = getWebviewHTML(webviewView.webview);
-                webviewView.webview.onDidReceiveMessage(msg => {
-                    handleWebviewMessage({ webview: webviewView.webview, reveal: () => webviewView.show(true) }, msg);
-                });
-            }
-        })
-    );
+  // Sidebar view
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider('win7-ai-coder.chatView', {
+      resolveWebviewView: function(webviewView) {
+        webviewView.webview.options = {
+          enableScripts: true,
+          localResourceRoots: [
+            vscode.Uri.joinPath(context.extensionUri, 'media')
+          ]
+        };
+        webviewView.webview.html = getWebviewHTML(webviewView.webview);
+        webviewView.webview.onDidReceiveMessage(function(msg) {
+          handleWebviewMessage(
+            { webview: webviewView.webview, reveal: function() { webviewView.show(true); } },
+            msg
+          );
+        });
+      }
+    })
+  );
+
+  // Listen for workspace changes
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeWorkspaceFolders(function(e) {
+      if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
+        workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
+      }
+    })
+  );
 }
 
 function openChatPanel(context) {
-    if (chatPanel) {
-        chatPanel.reveal();
-        return chatPanel;
-    }
-
-    chatPanel = vscode.window.createWebviewPanel(
-        'win7-ai-coder.chat',
-        'AI Chat',
-        vscode.ViewColumn.Two,
-        {
-            enableScripts: true,
-            retainContextWhenHidden: true,
-            localResourceRoots: [
-                vscode.Uri.joinPath(context.extensionUri, 'media'),
-            ],
-        }
-    );
-
-    chatPanel.webview.html = getWebviewHTML(chatPanel.webview);
-
-    chatPanel.webview.onDidReceiveMessage(msg => {
-        handleWebviewMessage(chatPanel, msg);
-    });
-
-    chatPanel.onDidDispose(() => {
-        chatPanel = null;
-    });
-
+  if (chatPanel) {
+    chatPanel.reveal();
     return chatPanel;
+  }
+
+  chatPanel = vscode.window.createWebviewPanel(
+    'win7-ai-coder.chat',
+    'AI Agent',
+    vscode.ViewColumn.Two,
+    {
+      enableScripts: true,
+      retainContextWhenHidden: true,
+      localResourceRoots: [
+        vscode.Uri.joinPath(context.extensionUri, 'media')
+      ]
+    }
+  );
+
+  chatPanel.webview.html = getWebviewHTML(chatPanel.webview);
+  chatPanel.webview.onDidReceiveMessage(function(msg) {
+    handleWebviewMessage(chatPanel, msg);
+  });
+  chatPanel.onDidDispose(function() {
+    chatPanel = null;
+  });
+
+  return chatPanel;
 }
 
 function deactivate() {
-    chatPanel = null;
-    chatHistory = [];
+  chatPanel = null;
+  chatHistory = [];
 }
 
-module.exports = { activate, deactivate };
+module.exports = { activate: activate, deactivate: deactivate };

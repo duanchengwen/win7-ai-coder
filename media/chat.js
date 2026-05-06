@@ -1,318 +1,254 @@
 /* ============================================
-   Win7 AI Coder — Chat Panel (Webview Script)
-   在 VSCode Webview 内运行，通过 postMessage 与扩展通信
+   Win7 AI Coder v3 — Chat Panel (Agent Mode)
    ============================================ */
 
 (function() {
-  const vscode = acquireVsCodeApi();
+  var vscode = acquireVsCodeApi();
+  var isBusy = false;
+  var contextData = null;
 
-  // ── State ─────────────────────────────────────────
-  let isStreaming = false;
-  let currentAssistantMsg = null;   // DOM element of current streaming message
-  let currentContentDiv = null;
-  let contextData = null;            // { fileContent, selection, label }
+  var messagesEl = document.getElementById('messages');
+  var inputEl = document.getElementById('input');
+  var sendBtn = document.getElementById('btn-send');
+  var contextBar = document.getElementById('context-bar');
+  var contextLabel = document.getElementById('context-label');
+  var btnClear = document.getElementById('btn-clear');
+  var btnConfig = document.getElementById('btn-config');
+  var btnRemoveCtx = document.getElementById('btn-remove-context');
 
-  // ── DOM refs ─────────────────────────────────────
-  const messagesEl = document.getElementById('messages');
-  const inputEl = document.getElementById('input');
-  const sendBtn = document.getElementById('btn-send');
-  const contextBar = document.getElementById('context-bar');
-  const contextLabel = document.getElementById('context-label');
-  const btnClear = document.getElementById('btn-clear');
-  const btnConfig = document.getElementById('btn-config');
-  const btnRemoveCtx = document.getElementById('btn-remove-context');
-  const typingEl = document.getElementById('typing');
-
-  // ── Markdown Renderer ────────────────────────────
-  function escapeHtml(str) {
+  // ─── Escape ──────────────────────────────────────
+  function esc(str) {
     if (!str) return '';
-    var div = document.createElement('div');
-    div.appendChild(document.createTextNode(str));
-    return div.innerHTML;
+    var d = document.createElement('div');
+    d.appendChild(document.createTextNode(str));
+    return d.innerHTML;
   }
 
-  function renderMarkdown(text) {
-    if (!text) return '';
-    var html = escapeHtml(text);
+  function escAttr(str) {
+    return (str || '').replace(/"/g, '&quot;');
+  }
 
-    // Code blocks with language header
+  // ─── Markdown (simple) ───────────────────────────
+  function md(html) {
+    if (!html) return '';
+    html = esc(html);
     html = html.replace(/```(\w*)\n?([\s\S]*?)```/g, function(m, lang, code) {
-      lang = lang || 'code';
-      return '<div class="code-header"><span>' + escapeHtml(lang) + '</span>' +
-             '<button class="copy-btn" onclick="window.__copyCode(this)">📋 复制</button></div>' +
-             '<pre><code class="language-' + escapeHtml(lang) + '">' +
-             escapeHtml(code.trim()) + '</code></pre>';
+      return '<div class="code-header"><span>' + esc(lang || 'code') + '</span>' +
+             '<button class="copy-btn" onclick="__cc(this)">\u{1F4CB} 复制</button></div>' +
+             '<pre><code>' + esc(code.trim()) + '</code></pre>';
     });
-
-    // Inline code
     html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
-
-    // Bold, italic
     html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
     html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
-
-    // Triple newline → paragraph break
     html = html.replace(/\n\n+/g, '</p><p>');
     html = html.replace(/\n/g, '<br>');
-
-    // Headers
-    html = html.replace(/^### (.+)$/gm, '<h4>$1</h4>');
-    html = html.replace(/^## (.+)$/gm, '<h3>$1</h3>');
-    html = html.replace(/^# (.+)$/gm, '<h2>$1</h2>');
-
-    // Wrap in paragraph if not already wrapped
     if (html.indexOf('<p>') !== 0 && html.indexOf('<h') !== 0 &&
         html.indexOf('<div') !== 0 && html.indexOf('<pre') !== 0) {
       html = '<p>' + html + '</p>';
     }
-
     return html;
   }
 
-  // ── Copy code handler ────────────────────────────
-  window.__copyCode = function(btn) {
-    var header = btn.parentElement;
-    var pre = header.nextElementSibling;
+  window.__cc = function(btn) {
+    var pre = (btn.parentElement || {}).nextElementSibling;
     if (!pre || pre.tagName !== 'PRE') return;
     var code = pre.textContent || '';
-
     if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(code).then(function() {
-        setCopied(btn);
-      }).catch(function() {
-        fallbackCopy(code, btn);
-      });
+      navigator.clipboard.writeText(code).then(function() { setCp(btn); }, function() { fc(code, btn); });
     } else {
-      fallbackCopy(code, btn);
+      fc(code, btn);
     }
   };
 
-  function fallbackCopy(text, btn) {
+  function fc(text, btn) {
     var ta = document.createElement('textarea');
     ta.value = text;
-    ta.style.position = 'fixed';
-    ta.style.opacity = '0';
+    ta.style.cssText = 'position:fixed;opacity:0';
     document.body.appendChild(ta);
     ta.select();
-    try {
-      document.execCommand('copy');
-      setCopied(btn);
-    } catch(e) {
-      btn.textContent = '❌';
-    }
+    try { document.execCommand('copy'); setCp(btn); } catch(e) { btn.textContent = '\u274C'; }
     document.body.removeChild(ta);
   }
 
-  function setCopied(btn) {
-    btn.textContent = '✅ 已复制';
-    setTimeout(function() { btn.textContent = '📋 复制'; }, 1500);
+  function setCp(btn) {
+    btn.textContent = '\u2705 已复制';
+    setTimeout(function() { btn.textContent = '\u{1F4CB} 复制'; }, 1500);
   }
 
-  // ── DOM Helpers ──────────────────────────────────
+  // ─── DOM helpers ─────────────────────────────────
 
-  function createMsgDiv(role) {
-    var div = document.createElement('div');
-    div.className = 'msg msg-' + role;
-    var label = document.createElement('div');
-    label.className = 'msg-label';
-    label.textContent = role === 'user' ? '你' : (role === 'error' ? '错误' : 'AI');
-    div.appendChild(label);
+  function addMsg(role) {
+    var w = messagesEl.querySelector('.welcome');
+    if (w) w.remove();
 
-    var content = document.createElement('div');
-    content.className = 'msg-content';
-    div.appendChild(content);
-
-    return { wrapper: div, content: content };
+    var d = document.createElement('div');
+    d.className = 'msg msg-' + role;
+    var lbl = document.createElement('div');
+    lbl.className = 'msg-label';
+    var labels = { user: '\u{1F464} 你', assistant: '\u{1F916} AI', tool: '\u{1F527} 工具', error: '\u274C 错误' };
+    lbl.textContent = labels[role] || role;
+    d.appendChild(lbl);
+    var c = document.createElement('div');
+    c.className = 'msg-content';
+    d.appendChild(c);
+    messagesEl.appendChild(d);
+    return { w: d, c: c };
   }
 
-  function addUserMessage(text) {
-    var msg = createMsgDiv('user');
-    msg.content.textContent = text;
-    messagesEl.appendChild(msg.wrapper);
-  }
-
-  function addAssistantMessage() {
-    // Remove welcome if present
-    var welcome = messagesEl.querySelector('.welcome');
-    if (welcome) welcome.remove();
-
-    var msg = createMsgDiv('assistant');
-    // Add cursor for streaming
-    var cursor = document.createElement('span');
-    cursor.className = 'msg-cursor';
-    msg.wrapper.appendChild(cursor);
-    messagesEl.appendChild(msg.wrapper);
-
-    currentAssistantMsg = msg.wrapper;
-    currentContentDiv = msg.content;
-    return msg;
-  }
-
-  function addErrorMessage(text) {
-    var welcome = messagesEl.querySelector('.welcome');
-    if (welcome) welcome.remove();
-
-    var msg = createMsgDiv('error');
-    msg.content.innerHTML = renderMarkdown(text);
-    messagesEl.appendChild(msg.wrapper);
-  }
-
-  function scrollToBottom() {
+  function scrollBottom() {
     messagesEl.scrollTop = messagesEl.scrollHeight;
   }
 
-  function clearWelcome() {
-    var welcome = messagesEl.querySelector('.welcome');
-    if (welcome) welcome.remove();
+  // ─── Tool call progress ──────────────────────────
+
+  function addToolStart(name, args, preview) {
+    var w = messagesEl.querySelector('.welcome');
+    if (w) w.remove();
+
+    var d = document.createElement('div');
+    d.className = 'tool-call';
+    d.setAttribute('data-tool', name);
+    var iconMap = {
+      read_file: '\u{1F4D6}', write_file: '\u270F\uFE0F',
+      list_dir: '\u{1F4C2}', search_code: '\u{1F50D}',
+      run_terminal: '\u2328\uFE0F'
+    };
+    d.innerHTML =
+      '<div class="tool-header">' +
+      '  <span class="tool-icon">' + (iconMap[name] || '\u{1F527}') + '</span>' +
+      '  <span class="tool-name">' + esc(name) + '</span>' +
+      '  <span class="tool-spinner">\u23F3</span>' +
+      '</div>' +
+      '<div class="tool-args">' + esc(preview) + '</div>' +
+      '<div class="tool-result" style="display:none;"></div>';
+    messagesEl.appendChild(d);
+    scrollBottom();
+    return d;
   }
 
-  function resetChat() {
-    messagesEl.innerHTML = '<div class="welcome">' +
-      '<div class="welcome-icon">🤖</div>' +
-      '<div class="welcome-title">Win7 AI Coder</div>' +
-      '<div class="welcome-sub">本地 DeepSeek 编程助手</div>' +
-      '<div class="welcome-hints">' +
-      '<div class="hint"><span class="hint-key">打开文件</span> 后提问，AI 能直接分析代码</div>' +
-      '<div class="hint"><span class="hint-key">选中代码</span> 右键 → Ask AI</div>' +
-      '<div class="hint"><span class="hint-key">Ctrl+Shift+P</span> → AI Chat: Explain Code</div>' +
-      '</div></div>';
-    currentAssistantMsg = null;
-    currentContentDiv = null;
-    isStreaming = false;
+  function finishToolStart(d, result) {
+    var spinner = d.querySelector('.tool-spinner');
+    if (spinner) spinner.textContent = '\u2705';
+    var resDiv = d.querySelector('.tool-result');
+    if (resDiv) {
+      resDiv.style.display = 'block';
+      resDiv.textContent = result.substring(0, 600);
+    }
+    scrollBottom();
   }
 
-  // ── Send message ─────────────────────────────────
+  // ─── Send ────────────────────────────────────────
 
-  function sendMessage() {
+  function send() {
     var text = inputEl.value.trim();
-    if (!text || isStreaming) return;
+    if (!text || isBusy) return;
 
-    addUserMessage(text);
-    scrollToBottom();
-
+    addMsg('user').c.textContent = text;
+    scrollBottom();
     inputEl.value = '';
     sendBtn.disabled = true;
-    updateInputHeight();
+    updateHeight();
+    isBusy = true;
 
-    var msg = addAssistantMessage();
-    scrollToBottom();
-
-    isStreaming = true;
-
-    // Send to extension host
     vscode.postMessage({
       type: 'chat',
       text: text,
-      fileContext: contextData ? contextData.fileContent : '',
-      selection: contextData ? contextData.selection : '',
+      fileContext: contextData ? contextData.fileContent || '' : ''
     });
   }
 
-  // ── Event Handlers ───────────────────────────────
+  // ─── Event handlers ──────────────────────────────
 
   inputEl.addEventListener('keydown', function(e) {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      sendMessage();
-    }
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
   });
-
   inputEl.addEventListener('input', function() {
-    sendBtn.disabled = !inputEl.value.trim() || isStreaming;
-    updateInputHeight();
+    sendBtn.disabled = !inputEl.value.trim() || isBusy;
+    updateHeight();
   });
-
-  function updateInputHeight() {
+  function updateHeight() {
     inputEl.style.height = 'auto';
     inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + 'px';
   }
-
-  sendBtn.addEventListener('click', sendMessage);
+  sendBtn.addEventListener('click', send);
 
   btnClear.addEventListener('click', function() {
     vscode.postMessage({ type: 'clear' });
   });
-
   btnConfig.addEventListener('click', function() {
     vscode.postMessage({ type: 'attachFile' });
   });
-
   btnRemoveCtx.addEventListener('click', function() {
     contextData = null;
     contextBar.style.display = 'none';
     contextLabel.textContent = '';
   });
 
-  // ── Message from Extension Host ──────────────────
+  // ─── Messages from Extension ─────────────────────
 
-  window.addEventListener('message', function(event) {
-    var msg = event.data;
+  window.addEventListener('message', function(e) {
+    var m = e.data;
 
-    switch (msg.type) {
-      case 'token':
-        if (currentContentDiv) {
-          // Append raw text during streaming
-          var currentText = currentContentDiv.textContent || '';
-          currentText += msg.content;
-          currentContentDiv.textContent = currentText;
-          scrollToBottom();
-        }
+    switch (m.type) {
+      case 'user':
+        // Already shown by send(), no-op
         break;
 
-      case 'streamEnd':
-        isStreaming = false;
+      case 'tool-start':
+        addToolStart(m.name, m.args, m.preview || '');
+        break;
+
+      case 'tool-end':
+        var el = messagesEl.querySelector('.tool-call[data-tool="' + escAttr(m.name) + '"]:last-child');
+        if (el) finishToolStart(el, m.result || '');
+        break;
+
+      case 'assistant':
+        var am = addMsg('assistant');
+        am.c.innerHTML = md(m.content || '');
+        scrollBottom();
+        break;
+
+      case 'agent-start':
+        // Show thinking indicator
+        break;
+
+      case 'agent-end':
+        isBusy = false;
         sendBtn.disabled = !inputEl.value.trim();
-        if (currentContentDiv && currentAssistantMsg) {
-          // Final render with markdown
-          var rawText = currentContentDiv.textContent || '';
-          currentContentDiv.innerHTML = renderMarkdown(rawText);
-          var cursor = currentAssistantMsg.querySelector('.msg-cursor');
-          if (cursor) cursor.style.display = 'none';
-        }
-        scrollToBottom();
         break;
 
       case 'error':
-        isStreaming = false;
+        var em = addMsg('error');
+        em.c.innerHTML = md(m.content || 'Unknown error');
+        isBusy = false;
         sendBtn.disabled = !inputEl.value.trim();
-        if (currentAssistantMsg) {
-          currentAssistantMsg.remove();
-          currentAssistantMsg = null;
-          currentContentDiv = null;
-        }
-        addErrorMessage(msg.content);
-        scrollToBottom();
+        scrollBottom();
         break;
 
       case 'cleared':
-        resetChat();
-        break;
-
-      case 'streamStart':
-        // Handled by addAssistantMessage() in sendMessage()
+        messagesEl.innerHTML =
+          '<div class="welcome">' +
+          '  <div class="welcome-icon">\u{1F916}</div>' +
+          '  <div class="welcome-title">Win7 AI Coder v3</div>' +
+          '  <div class="welcome-sub">Agent mode \u2014 \u8BFB\u9879\u76EE \u2192 \u5206\u6790 \u2192 \u521B\u5EFA\u6587\u4EF6 \u2192 \u5199\u4EE3\u7801</div>' +
+          '</div>';
         break;
 
       case 'config':
-        // Model name shown in UI if needed
+        // Not used currently
         break;
 
       case 'contextSet':
-        contextData = {
-          fileContent: msg.fileContent || '',
-          selection: msg.selection || '',
-          label: msg.label || '文件已附加',
-        };
+        contextData = { fileContent: m.fileContent || '', label: m.label || '' };
         contextBar.style.display = 'flex';
-        contextLabel.textContent = msg.label || '文件已附加';
+        contextLabel.textContent = m.label || '';
         break;
 
       case 'status':
-        // Simple status notification
         break;
     }
   });
 
-  // ── Init ─────────────────────────────────────────
   vscode.postMessage({ type: 'ready' });
-
 })();

@@ -5,7 +5,7 @@ If a real model is available via Ollama, it can proxy to it.
 """
 import os, sys, json, time, threading, http.server
 
-PORT = 8080
+PORT = 8888
 
 class MockHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
