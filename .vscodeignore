@@ -1,0 +1,9 @@
+.vscode/**
+.vscode-test/**
+node_modules/
+src/**
+media/codemirror.css
+media/highlight.css
+.gitignore
+.vscodeignore
+*.vsix

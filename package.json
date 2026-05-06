@@ -1,0 +1,162 @@
+{
+  "name": "win7-ai-coder",
+  "displayName": "Win7 AI Coder",
+  "description": "AI coding assistant powered by local DeepSeek models — works on Windows 7 / VSCode 1.69",
+  "version": "2.0.0",
+  "publisher": "win7-ai",
+  "license": "MIT",
+  "icon": "resources/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/win7-ai/win7-ai-coder"
+  },
+  "engines": {
+    "vscode": "^1.69.0"
+  },
+  "categories": [
+    "Machine Learning",
+    "Programming Languages",
+    "Other"
+  ],
+  "keywords": [
+    "ai",
+    "deepseek",
+    "coding assistant",
+    "llama.cpp",
+    "windows 7",
+    "code generation"
+  ],
+  "activationEvents": [
+    "onCommand:win7-ai-coder.openChat",
+    "onCommand:win7-ai-coder.askSelection",
+    "onCommand:win7-ai-coder.explainCode",
+    "onCommand:win7-ai-coder.generateDocs",
+    "onView:win7-ai-coder.chatView"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "win7-ai-coder.openChat",
+        "title": "AI Chat: Open Chat Panel",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "win7-ai-coder.askSelection",
+        "title": "AI Chat: Ask About Selected Code"
+      },
+      {
+        "command": "win7-ai-coder.explainCode",
+        "title": "AI Chat: Explain This File"
+      },
+      {
+        "command": "win7-ai-coder.generateDocs",
+        "title": "AI Chat: Generate Documentation"
+      },
+      {
+        "command": "win7-ai-coder.clearChat",
+        "title": "AI Chat: Clear Chat History"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "win7-ai-coder.askSelection",
+          "when": "editorHasSelection",
+          "group": "ai@1"
+        },
+        {
+          "command": "win7-ai-coder.explainCode",
+          "group": "ai@2"
+        },
+        {
+          "command": "win7-ai-coder.generateDocs",
+          "group": "ai@3"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "win7-ai-coder.openChat",
+          "group": "navigation"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "win7-ai-coder-sidebar",
+          "title": "AI Coder",
+          "icon": "$(hubot)"
+        }
+      ]
+    },
+    "views": {
+      "win7-ai-coder-sidebar": [
+        {
+          "type": "webview",
+          "id": "win7-ai-coder.chatView",
+          "name": "AI Chat"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Win7 AI Coder",
+      "properties": {
+        "win7-ai-coder.provider": {
+          "type": "string",
+          "default": "openai",
+          "enum": ["openai", "ollama"],
+          "description": "LLM API format"
+        },
+        "win7-ai-coder.openaiBaseUrl": {
+          "type": "string",
+          "default": "http://localhost:8080/v1",
+          "description": "OpenAI-compatible API base URL (llama.cpp server / vLLM / LocalAI / Ollama)"
+        },
+        "win7-ai-coder.openaiApiKey": {
+          "type": "string",
+          "default": "not-needed",
+          "description": "API key (usually 'not-needed' for local models)"
+        },
+        "win7-ai-coder.openaiModel": {
+          "type": "string",
+          "default": "deepseek-coder",
+          "description": "Model name"
+        },
+        "win7-ai-coder.ollamaBaseUrl": {
+          "type": "string",
+          "default": "http://localhost:11434",
+          "description": "Ollama API base URL"
+        },
+        "win7-ai-coder.ollamaModel": {
+          "type": "string",
+          "default": "deepseek-coder:6.7b",
+          "description": "Ollama model name"
+        },
+        "win7-ai-coder.maxTokens": {
+          "type": "number",
+          "default": 8192,
+          "description": "Max tokens per response"
+        },
+        "win7-ai-coder.temperature": {
+          "type": "number",
+          "default": 0.15,
+          "minimum": 0,
+          "maximum": 2,
+          "description": "Temperature (lower = more deterministic)"
+        },
+        "win7-ai-coder.enableStreaming": {
+          "type": "boolean",
+          "default": true,
+          "description": "Stream responses token-by-token"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/vscode": "1.69.0"
+  }
+}
