@@ -296,9 +296,6 @@ var completionDebounceTimer = null;
 var lastCompletionRequest = 0;
 
 function InlineCompletionProvider() {}
-InlineCompletionProvider.prototype = Object.create(vscode.InlineCompletionItemProvider.prototype);
-InlineCompletionProvider.prototype.constructor = InlineCompletionProvider;
-
 InlineCompletionProvider.prototype.provideInlineCompletionItems = function(document, position, context, token) {
   var cfg = getConfig();
   if (!cfg.enableInlineCompletion) return [];
@@ -1486,13 +1483,17 @@ function activate(context) {
   // Phase 2: Register inline completion provider
   var cfg = getConfig();
   if (cfg.enableInlineCompletion) {
-    context.subscriptions.push(
-      vscode.languages.registerInlineCompletionItemProvider(
-        { pattern: '**' },
-        new InlineCompletionProvider()
-      )
-    );
-    console.log('[Win7 AI] Inline completion provider registered');
+    try {
+      context.subscriptions.push(
+        vscode.languages.registerInlineCompletionItemProvider(
+          { pattern: '**' },
+          new InlineCompletionProvider()
+        )
+      );
+      console.log('[Win7 AI] Inline completion provider registered');
+    } catch (e) {
+      console.log('[Win7 AI] Inline completion provider failed (non-fatal): ' + e.message);
+    }
   }
 
   // Commands
