@@ -1,32 +1,27 @@
-/**
- * Win7 AI Coder v3 — VSCode Extension with Codex-style Agent Loop
- * =================================================================
- *
- * 架构:
- *   Webview ← postMessage → Agent Loop → DeepSeek API (tool calling) → 读/写/搜文件
- *
- * 支持的 DeepSeek 模型:
- *   deepseek-chat       → V4 Flash (快速，代码场景推荐)
- *   deepseek-reasoner   → R1 (深度推理)
- *
- * 兼容 VSCode 1.69 / Node 12.x (无可选链、无模板字符串)
- */
+/* ============================================
+   Win7 AI Coder v5 — VSCode Extension
+   @-mentions + Slash Commands + Tab Autocomplete
+   + Codebase Index + Thinking Animation
+   ============================================
+   兼容 VSCode 1.69 / Node 12.x
+   ============================================ */
 
-const vscode = require('vscode');
-const http = require('http');
-const https = require('https');
-const url = require('url');
-const fs = require('fs');
-const path = require('path');
-const cp = require('child_process');
+var vscode = require('vscode');
+var http = require('http');
+var https = require('https');
+var url = require('url');
+var fs = require('fs');
+var pathModule = require('path');
+var cp = require('child_process');
 
 // ─── 全局 ─────────────────────────────────────────────
 var chatPanel = null;
 var chatHistory = [];
 var extensionContext = null;
 var workspaceRoot = '';
+var codebaseIndex = null;  // Phase 3: cached codebase index
 
-// ─── 工具定义 (OpenAI function-calling 格式) ──────────
+// ─── 工具定义 ─────────────────────────────────────────
 
 var TOOLS = [
   {
@@ -76,12 +71,12 @@ var TOOLS = [
     type: 'function',
     function: {
       name: 'search_code',
-      description: 'Search for text or regex pattern in project files.',
+      description: 'Search for text or regex pattern in project files (uses prebuilt codebase index if available).',
       parameters: {
         type: 'object',
         properties: {
           pattern: { type: 'string', description: 'Text or regex pattern to search for' },
-          path: { type: 'string', description: 'Directory to search in (defaults to workspace)' },
+          path: { type: 'string', description: 'Directory or file to search in (defaults to workspace)' },
           file_glob: { type: 'string', description: 'Optional file glob filter, e.g. *.py' }
         },
         required: ['pattern']
@@ -134,18 +129,333 @@ function getConfig() {
     maxTokens: cfg.get('maxTokens', 8192),
     temperature: cfg.get('temperature', 0.0),
     streaming: cfg.get('enableStreaming', true),
-    maxToolRounds: 15
+    maxToolRounds: 15,
+    enableInlineCompletion: cfg.get('enableInlineCompletion', true),
+    inlineCompletionDebounce: cfg.get('inlineCompletionDebounce', 400)
   };
 }
-
-// ─── 工具执行器 ──────────────────────────────────────
 
 function resolvePath(p) {
   if (!p) return workspaceRoot || process.cwd();
   if (p.startsWith('/') || /^[A-Za-z]:/.test(p)) return p;
   var base = workspaceRoot || process.cwd();
-  return path.join(base, p);
+  return pathModule.join(base, p);
 }
+
+// ─── PHASE 3: Codebase Index ───────────────────────
+
+function getIndexPath() {
+  if (!workspaceRoot) return null;
+  return pathModule.join(workspaceRoot, '.vscode', 'win7-ai-codebase-index.json');
+}
+
+function buildCodebaseIndex(rootDir) {
+  var index = { files: {}, tokens: {}, builtAt: Date.now() };
+
+  function walk(dir) {
+    try {
+      var items = fs.readdirSync(dir);
+      for (var i = 0; i < items.length; i++) {
+        var name = items[i];
+        if (name.startsWith('.')) continue;
+        var full = pathModule.join(dir, name);
+        try {
+          var st = fs.statSync(full);
+          if (st.isDirectory()) {
+            if (['node_modules','__pycache__','.git','venv','.venv','dist','build','.idea'].indexOf(name) < 0) {
+              walk(full);
+            }
+          } else {
+            var ext = pathModule.extname(name).toLowerCase();
+            if (['.png','.jpg','.gif','.zip','.exe','.dll','.so','.pyc','.bin','.pdf'].indexOf(ext) >= 0) continue;
+            if (st.size > 500 * 1024) continue;
+            var relPath = pathModule.relative(rootDir, full);
+            var content = fs.readFileSync(full, 'utf-8');
+            var lines = content.split('\n');
+            index.files[relPath] = { size: st.size, lines: lines.length, mtime: st.mtimeMs };
+
+            // Build keyword inverted index for common words
+            var words = content.toLowerCase().split(/[^a-zA-Z0-9_]/);
+            var seen = {};
+            for (var w = 0; w < words.length; w++) {
+              var word = words[w];
+              if (word.length < 3 || word.length > 40) continue;
+              if (seen[word]) continue;
+              seen[word] = true;
+              if (!index.tokens[word]) index.tokens[word] = [];
+              if (index.tokens[word].length < 20) {
+                index.tokens[word].push(relPath);
+              }
+            }
+          }
+        } catch(e) {}
+      }
+    } catch(e) {}
+  }
+
+  walk(rootDir);
+  return index;
+}
+
+function saveCodebaseIndex() {
+  var indexPath = getIndexPath();
+  if (!indexPath || !workspaceRoot) return;
+  try {
+    var idx = buildCodebaseIndex(workspaceRoot);
+    var dir = pathModule.dirname(indexPath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(indexPath, JSON.stringify(idx), 'utf-8');
+    codebaseIndex = idx;
+    console.log('[Win7 AI] Codebase index built: ' + Object.keys(idx.files).length + ' files');
+  } catch(e) {
+    console.log('[Win7 AI] Index build failed: ' + e.message);
+  }
+}
+
+function loadCodebaseIndex() {
+  var indexPath = getIndexPath();
+  if (!indexPath) return null;
+  try {
+    if (fs.existsSync(indexPath)) {
+      var data = fs.readFileSync(indexPath, 'utf-8');
+      var idx = JSON.parse(data);
+      codebaseIndex = idx;
+      console.log('[Win7 AI] Codebase index loaded: ' + Object.keys(idx.files).length + ' files');
+      return idx;
+    }
+  } catch(e) {}
+  return null;
+}
+
+function searchIndexedCodebase(pattern, limit) {
+  limit = limit || 10;
+  if (!codebaseIndex) return null; // Signal to fall back to walk search
+
+  var lowerPattern = pattern.toLowerCase();
+  var matchedFiles = {};
+  var results = [];
+  var count = 0;
+
+  // Exact token match
+  if (codebaseIndex.tokens[lowerPattern]) {
+    var files = codebaseIndex.tokens[lowerPattern];
+    for (var i = 0; i < files.length && count < limit; i++) {
+      var f = files[i];
+      if (!matchedFiles[f]) {
+        matchedFiles[f] = true;
+        count++;
+        var filePath = pathModule.join(workspaceRoot, f);
+        try {
+          var content = fs.readFileSync(filePath, 'utf-8');
+          var lines = content.split('\n');
+          for (var j = 0; j < lines.length; j++) {
+            if (lines[j].toLowerCase().indexOf(lowerPattern) >= 0) {
+              results.push(f + ':' + (j + 1) + '  ' + lines[j].trim().substring(0, 100));
+              break;
+            }
+          }
+        } catch(e) {}
+      }
+    }
+  }
+
+  // Partial token match (prefix/suffix)
+  if (results.length < limit) {
+    for (var token in codebaseIndex.tokens) {
+      if (results.length >= limit) break;
+      if (matchedFiles[token]) continue;
+      if (token.indexOf(lowerPattern) >= 0) {
+        var files2 = codebaseIndex.tokens[token];
+        for (var k = 0; k < files2.length && results.length < limit; k++) {
+          var f2 = files2[k];
+          if (!matchedFiles[f2]) {
+            matchedFiles[f2] = true;
+            var filePath2 = pathModule.join(workspaceRoot, f2);
+            try {
+              var content2 = fs.readFileSync(filePath2, 'utf-8');
+              var lines2 = content2.split('\n');
+              for (var l = 0; l < lines2.length; l++) {
+                if (lines2[l].toLowerCase().indexOf(lowerPattern) >= 0) {
+                  results.push(f2 + ':' + (l + 1) + '  ' + lines2[l].trim().substring(0, 100));
+                  break;
+                }
+              }
+            } catch(e) {}
+          }
+        }
+      }
+    }
+  }
+
+  return results.length > 0 ? results : null;
+}
+
+// ─── PHASE 2: Inline Completion Provider ──────────
+
+var completionDebounceTimer = null;
+var lastCompletionRequest = 0;
+
+function InlineCompletionProvider() {}
+InlineCompletionProvider.prototype = Object.create(vscode.InlineCompletionItemProvider.prototype);
+InlineCompletionProvider.prototype.constructor = InlineCompletionProvider;
+
+InlineCompletionProvider.prototype.provideInlineCompletionItems = function(document, position, context, token) {
+  var cfg = getConfig();
+  if (!cfg.enableInlineCompletion) return [];
+
+  var now = Date.now();
+  var debounceMs = cfg.inlineCompletionDebounce;
+
+  // Debounce: skip if we just made a request
+  if (now - lastCompletionRequest < debounceMs) return [];
+
+  // Only suggest on new line or after typing/backspace
+  if (context.triggerKind === 0) return []; // Invoke: don't suggest on explicit invocation
+  // Actually 0 = Invoke, 1 = Auto. We want to trigger on Auto.
+  if (context.triggerKind !== 1) return [];
+
+  // Get context: current line prefix
+  var linePrefix = document.lineAt(position.line).text.substring(0, position.character);
+  var lineText = document.lineAt(position.line).text;
+
+  // Skip if line is empty or only whitespace within a block
+  var trimmed = lineText.trim();
+  if (!trimmed || trimmed === '{' || trimmed === '(' || trimmed === '[') return [];
+
+  // Skip if in a comment only line
+  if (trimmed.indexOf('//') === 0 || trimmed.indexOf('#') === 0 || trimmed.indexOf('--') === 0) return [];
+
+  // Get context above (last 5 lines)
+  var contextLines = [];
+  var startLine = Math.max(0, position.line - 5);
+  for (var i = startLine; i < position.line; i++) {
+    contextLines.push(document.lineAt(i).text);
+  }
+  contextLines.push(linePrefix);
+
+  var contextStr = contextLines.join('\n');
+  var lang = document.languageId || 'text';
+
+  // Build quick prompt for inline completion
+  var prompt = 'Complete the current line of code (only respond with the completion text, NO explanations, NO code fences):\n\n'
+    + '```' + lang + '\n' + contextStr + '\n```\n\n'
+    + 'Complete after: "' + linePrefix + '"\n\n'
+    + 'Return ONLY the completion text that follows "' + linePrefix + '". No markdown. No explanation.';
+
+  // We need to return a Promise<InlineCompletionItem[]> but Node 12 doesn't have Promise.
+  // VSCode API in 1.69 supports thenable (an object with .then()), which is Promise-compatible
+  // but we can also use a simple Thenable polyfill.
+  // Since the extension host supports Promises even in Node 12 (VSCode provides its own),
+  // let's use the callback approach instead.
+
+  var result = [];
+  lastCompletionRequest = now;
+
+  // Send async request to API
+  var self = this;
+  makeInlineCompletionRequest(prompt, function(error, completionText) {
+    if (!error && completionText) {
+      // Clean up the completion
+      completionText = completionText.trim();
+      // Remove code fences if the model added them
+      completionText = completionText.replace(/^```[\w]*\n?/, '');
+      completionText = completionText.replace(/\n?```$/, '');
+      // Remove line prefix if model included it
+      if (completionText.indexOf(linePrefix) === 0) {
+        completionText = completionText.substring(linePrefix.length);
+      }
+      // Remove leading/trailing whitespace for inline
+      completionText = completionText.replace(/^\s+/, '');
+      if (completionText) {
+        result.push(new vscode.InlineCompletionItem(completionText));
+      }
+    }
+  });
+
+  // Return a thenable (Promise-compatible object)
+  return {
+    then: function(resolve, reject) {
+      // Wait for async completion
+      var check = function() {
+        if (result.length > 0) {
+          resolve(result);
+        } else {
+          setTimeout(check, 50);
+        }
+      };
+      // Timeout after 3 seconds
+      var timeout = setTimeout(function() {
+        resolve([]);
+      }, 3000);
+      check();
+    }
+  };
+};
+
+function makeInlineCompletionRequest(prompt, callback) {
+  var cfg = getConfig();
+
+  var payload = {
+    model: cfg.model,
+    messages: [
+      { role: 'system', content: 'You are a code completion engine. Your only job is to complete the current line of code. Return ONLY the completion text. Do NOT include the existing text. Do NOT wrap in code fences. Do NOT explain.' },
+      { role: 'user', content: prompt }
+    ],
+    max_tokens: 64,
+    temperature: 0.1,
+    top_p: 0.9,
+    stream: false
+  };
+
+  var body = JSON.stringify(payload);
+  var parsed = url.parse(cfg.apiUrl);
+  var isHttps = parsed.protocol === 'https:';
+
+  var headers = {
+    'Content-Type': 'application/json',
+    'Content-Length': Buffer.byteLength(body, 'utf-8')
+  };
+  if (cfg.apiKey && cfg.apiKey !== 'not-needed') {
+    headers['Authorization'] = 'Bearer ' + cfg.apiKey;
+  }
+
+  var options = {
+    hostname: parsed.hostname,
+    port: parsed.port || (isHttps ? 443 : 80),
+    path: parsed.path,
+    method: 'POST',
+    headers: headers,
+    timeout: 5000
+  };
+
+  var transport = isHttps ? https : http;
+  var req = transport.request(options, function(res) {
+    var responseBody = '';
+    res.on('data', function(d) { responseBody += d; });
+    res.on('end', function() {
+      if (res.statusCode !== 200) {
+        callback(new Error('HTTP ' + res.statusCode), null);
+        return;
+      }
+      try {
+        var data = JSON.parse(responseBody);
+        var content = data.choices && data.choices[0] && data.choices[0].message
+          ? data.choices[0].message.content : '';
+        callback(null, content || '');
+      } catch(e) {
+        callback(e, null);
+      }
+    });
+  });
+
+  req.on('error', function(e) {
+    callback(e, null);
+  });
+  req.write(body);
+  req.end();
+}
+
+// ─── 工具执行器 ──────────────────────────────────────
 
 function executeTool(name, args, panel) {
   var result;
@@ -161,7 +471,16 @@ function executeTool(name, args, panel) {
         result = toolListDir(resolvePath(args.path || workspaceRoot));
         break;
       case 'search_code':
-        result = toolSearchCode(args.pattern || '', resolvePath(args.path || workspaceRoot), args.file_glob || '');
+        // Phase 3: Try indexed search first, fall back to walk
+        var indexed = null;
+        if (codebaseIndex && !args.file_glob) {
+          indexed = searchIndexedCodebase(args.pattern || '', 20);
+        }
+        if (indexed) {
+          result = 'Found ' + indexed.length + ' matches (indexed):\n\n' + indexed.join('\n');
+        } else {
+          result = toolSearchCode(args.pattern || '', resolvePath(args.path || workspaceRoot), args.file_glob || '');
+        }
         break;
       case 'run_terminal':
         result = toolRunTerminal(args.command || '', resolvePath(args.cwd || workspaceRoot));
@@ -190,7 +509,7 @@ function toolReadFile(filePath) {
 }
 
 function toolWriteFile(filePath, content) {
-  var dir = path.dirname(filePath);
+  var dir = pathModule.dirname(filePath);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(filePath, content, 'utf-8');
   return '[ok] File written: ' + filePath + ' (' + content.length + ' chars)';
@@ -205,7 +524,7 @@ function toolListDir(dirPath) {
   for (var i = 0; i < entries.length; i++) {
     var name = entries[i];
     if (name.startsWith('.')) continue;
-    var full = path.join(dirPath, name);
+    var full = pathModule.join(dirPath, name);
     try {
       var st = fs.statSync(full);
       if (st.isDirectory()) {
@@ -237,13 +556,13 @@ function toolSearchCode(pattern, dirPath, fileGlob) {
         if (results.length >= 100) return;
         var name = items[i];
         if (name.startsWith('.')) continue;
-        var full = path.join(dir, name);
+        var full = pathModule.join(dir, name);
         try {
           var st = fs.statSync(full);
           if (st.isDirectory()) {
             if (!excludeDirs[name]) walk(full);
           } else {
-            var ext = path.extname(name).toLowerCase();
+            var ext = pathModule.extname(name).toLowerCase();
             if (excludeExts[ext]) continue;
             if (fileGlob && !matchGlob(name, fileGlob)) continue;
             if (st.size > 200 * 1024) continue;
@@ -289,12 +608,13 @@ function toolRunTerminal(command, cwd) {
 // ─── Agent Loop ──────────────────────────────────────
 
 function agentLoop(panel, userText) {
-  // Initialize
   if (chatHistory.length === 0) {
     chatHistory.push({ role: 'system', content: SYSTEM_PROMPT });
   }
   chatHistory.push({ role: 'user', content: userText });
 
+  // Phase 4: Send thinking start
+  panel.webview.postMessage({ type: 'thinking-start' });
   panel.webview.postMessage({ type: 'agent-start' });
   runLoop(panel, 0);
 }
@@ -302,11 +622,17 @@ function agentLoop(panel, userText) {
 function runLoop(panel, round) {
   var cfg = getConfig();
   if (round >= cfg.maxToolRounds) {
-    // Force stop
-    panel.webview.postMessage({ type: 'error', content: '已超过最大工具轮数 (' + cfg.maxToolRounds + ')，请重述你的问题。' });
+    panel.webview.postMessage({ type: 'error', content: 'Tool round limit reached (' + cfg.maxToolRounds + '). Please rephrase your request.' });
     panel.webview.postMessage({ type: 'agent-end' });
+    panel.webview.postMessage({ type: 'thinking-end' });
     return;
   }
+
+  // Phase 4: Update thinking message with current round
+  panel.webview.postMessage({
+    type: 'thinking-update',
+    content: 'Thinking... (round ' + (round + 1) + '/' + cfg.maxToolRounds + ')'
+  });
 
   var payload = {
     model: cfg.model,
@@ -314,7 +640,7 @@ function runLoop(panel, round) {
     max_tokens: cfg.maxTokens,
     temperature: cfg.temperature,
     top_p: 0.95,
-    stream: false,       // Agent loop uses non-streaming for tool detection
+    stream: false,
     tools: TOOLS,
     tool_choice: 'auto'
   };
@@ -352,9 +678,10 @@ function runLoop(panel, round) {
           var em = (ej.error && ej.error.message) || '';
           if (em) errMsg = em;
         } catch(e) {}
-        chatHistory.pop(); // Remove the failed user message
+        chatHistory.pop();
         panel.webview.postMessage({ type: 'error', content: errMsg });
         panel.webview.postMessage({ type: 'agent-end' });
+        panel.webview.postMessage({ type: 'thinking-end' });
         return;
       }
 
@@ -363,6 +690,7 @@ function runLoop(panel, round) {
       } catch(e) {
         panel.webview.postMessage({ type: 'error', content: 'JSON parse error from API' });
         panel.webview.postMessage({ type: 'agent-end' });
+        panel.webview.postMessage({ type: 'thinking-end' });
         return;
       }
 
@@ -370,35 +698,44 @@ function runLoop(panel, round) {
       if (!msg) {
         panel.webview.postMessage({ type: 'error', content: 'API returned empty response' });
         panel.webview.postMessage({ type: 'agent-end' });
+        panel.webview.postMessage({ type: 'thinking-end' });
         return;
+      }
+
+      // Phase 4: Show reasoning if available (some models return reasoning_content)
+      if (msg.reasoning_content) {
+        panel.webview.postMessage({
+          type: 'reasoning',
+          content: msg.reasoning_content
+        });
       }
 
       // Check for tool calls
       var toolCalls = msg.tool_calls;
       if (toolCalls && toolCalls.length > 0) {
-        // Add assistant message with tool calls
         var assistantMsg = { role: 'assistant', content: msg.content || null };
         assistantMsg.tool_calls = toolCalls;
         chatHistory.push(assistantMsg);
 
-        // Execute all tools sequentially
-        var toolsToRun = toolCalls.slice(); // copy
+        var toolsToRun = toolCalls.slice();
         executeToolsSequentially(panel, toolsToRun, 0, function() {
           runLoop(panel, round + 1);
         });
         return;
       }
 
-      // Text response — stream it
+      // Text response
       chatHistory.push({ role: 'assistant', content: msg.content || '' });
       panel.webview.postMessage({ type: 'assistant', content: msg.content || '' });
       panel.webview.postMessage({ type: 'agent-end' });
+      panel.webview.postMessage({ type: 'thinking-end' });
     });
   });
 
   req.on('error', function(e) {
     panel.webview.postMessage({ type: 'error', content: 'Connection error: ' + e.message });
     panel.webview.postMessage({ type: 'agent-end' });
+    panel.webview.postMessage({ type: 'thinking-end' });
   });
   req.write(body);
   req.end();
@@ -420,24 +757,25 @@ function executeToolsSequentially(panel, toolCalls, index, done) {
     args = {};
   }
 
-  // Notify webview
+  // Phase 4: Show thinking update with current tool
+  panel.webview.postMessage({
+    type: 'thinking-update',
+    content: 'Running: ' + name + '...'
+  });
+
   var preview = name + ' ' + JSON.stringify(args).substring(0, 80);
   panel.webview.postMessage({ type: 'tool-start', name: name, args: args, preview: preview });
 
-  // Execute
   var result = executeTool(name, args, panel);
 
-  // Notify webview
   panel.webview.postMessage({ type: 'tool-end', name: name, result: result.substring(0, 500) });
 
-  // Add tool result to history
   chatHistory.push({
     role: 'tool',
     tool_call_id: tc.id,
     content: result
   });
 
-  // Small delay before next tool
   setTimeout(function() {
     executeToolsSequentially(panel, toolCalls, index + 1, done);
   }, 100);
@@ -454,7 +792,7 @@ function getWebviewHTML(webview) {
   );
 
   return '<!DOCTYPE html>\n' +
-'<html lang="zh-CN">\n' +
+'<html lang="en">\n' +
 '<head>\n' +
 '<meta charset="UTF-8">\n' +
 '<meta http-equiv="Content-Security-Policy"\n' +
@@ -469,19 +807,19 @@ function getWebviewHTML(webview) {
 '    <div id="header">\n' +
 '      <span class="header-title">\u{1F916} AI Agent</span>\n' +
 '      <div class="header-actions">\n' +
-'        <button id="btn-clear" class="icon-btn" title="清除">\u{1F5D1}</button>\n' +
-'        <button id="btn-config" class="icon-btn" title="附加文件">\u{1F4CE}</button>\n' +
+'        <button id="btn-clear" class="icon-btn" title="Clear">\u{1F5D1}</button>\n' +
+'        <button id="btn-config" class="icon-btn" title="Attach file">\u{1F4CE}</button>\n' +
 '      </div>\n' +
 '    </div>\n' +
 '    <div id="messages">\n' +
 '      <div class="welcome">\n' +
 '        <div class="welcome-icon">\u{1F916}</div>\n' +
-'        <div class="welcome-title">Win7 AI Coder v3</div>\n' +
-'        <div class="welcome-sub">Agent mode — 读项目 \u2192 分析 \u2192 创建文件 \u2192 写代码</div>\n' +
+'        <div class="welcome-title">Win7 AI Coder v5</div>\n' +
+'        <div class="welcome-sub">@-mentions · /commands · Tab autocomplete · Codebase index</div>\n' +
 '        <div class="welcome-hints">\n' +
-'          <div class="hint"><span class="hint-key">\u{1F4C2}</span> 加载工程后直接说\"帮我做一个xxx\"</div>\n' +
-'          <div class="hint"><span class="hint-key">\u{1F527}</span> AI 会自动读代码、创建文件、执行命令</div>\n' +
-'          <div class="hint"><span class="hint-key">\u231B</span> 左侧观察工具调用过程</div>\n' +
+'          <div class="hint"><span class="hint-key">@</span> Attach files, search codebase, or run terminal commands</div>\n' +
+'          <div class="hint"><span class="hint-key">/</span> Quick commands: /edit, /commit, /test, /explain, /clear</div>\n' +
+'          <div class="hint"><span class="hint-key">Tab</span> Inline autocomplete while typing (configurable)</div>\n' +
 '        </div>\n' +
 '      </div>\n' +
 '    </div>\n' +
@@ -490,8 +828,12 @@ function getWebviewHTML(webview) {
 '        <span id="context-label"></span>\n' +
 '        <button id="btn-remove-context" class="small-btn">&times;</button>\n' +
 '      </div>\n' +
+'      <div id="thinking-indicator" style="display:none;" class="thinking-bar">\n' +
+'        <span class="thinking-spinner">\u23F3</span>\n' +
+'        <span id="thinking-text" class="thinking-text">Thinking...</span>\n' +
+'      </div>\n' +
 '      <div id="input-row">\n' +
-'        <textarea id="input" rows="2" placeholder="告诉我你要做什么，我来读项目、写代码... (Enter 发送)"></textarea>\n' +
+'        <textarea id="input" rows="2" placeholder="Ask me to read, write, search, or run anything... (Enter to send)"></textarea>\n' +
 '        <button id="btn-send" class="send-btn" disabled>\u25B6</button>\n' +
 '      </div>\n' +
 '    </div>\n' +
@@ -508,6 +850,15 @@ function handleWebviewMessage(panel, message) {
     case 'chat':
       handleChat(panel, message);
       break;
+    case 'chatWithMentions':
+      handleChatWithMentions(panel, message);
+      break;
+    case 'resolveMention':
+      handleResolveMention(panel, message);
+      break;
+    case 'runCommand':
+      handleRunCommand(panel, message);
+      break;
     case 'clear':
       chatHistory = [];
       panel.webview.postMessage({ type: 'cleared' });
@@ -517,7 +868,8 @@ function handleWebviewMessage(panel, message) {
       panel.webview.postMessage({
         type: 'config',
         model: cfg.model,
-        ws: workspaceRoot || '(无工作区)'
+        ws: workspaceRoot || '(no workspace)',
+        inlineComplete: cfg.enableInlineCompletion
       });
       break;
     case 'attachFile':
@@ -526,30 +878,558 @@ function handleWebviewMessage(panel, message) {
   }
 }
 
-function handleChat(panel, message) {
-  var text = (message.text || '').trim();
-  if (!text) return;
+// ─── @-mention resolver ───────────────────────────
 
-  // Attach workspace info if first message
+function handleResolveMention(panel, message) {
+  var type = message.mentionType;
+  var query = (message.query || '').trim();
+
+  if (!query || !workspaceRoot) {
+    panel.webview.postMessage({ type: 'mentionResult', results: [] });
+    return;
+  }
+
+  if (type === 'file') {
+    resolveFileMention(panel, query);
+  } else if (type === 'folder') {
+    resolveFolderMention(panel, query);
+  } else if (type === 'codebase') {
+    resolveCodebaseMention(panel, query);
+  } else if (type === 'terminal') {
+    resolveTerminalMention(panel, query);
+  }
+}
+
+function resolveFileMention(panel, query) {
+  var results = [];
+  var found = {};
+  var basePath = workspaceRoot;
+
+  function walkDir(dir, depth) {
+    if (depth > 3) return;
+    if (results.length >= 20) return;
+    try {
+      var items = fs.readdirSync(dir);
+      for (var i = 0; i < items.length; i++) {
+        if (results.length >= 20) return;
+        var name = items[i];
+        if (name.startsWith('.')) continue;
+        var full = pathModule.join(dir, name);
+        try {
+          var st = fs.statSync(full);
+          var relPath = pathModule.relative(basePath, full);
+          var lowerName = name.toLowerCase();
+          var lowerQuery = query.toLowerCase();
+          var match = lowerName.indexOf(lowerQuery) >= 0
+                   || relPath.toLowerCase().indexOf(lowerQuery) >= 0;
+          if (!match && depth === 0) continue;
+
+          if (st.isDirectory()) {
+            if (match && !found[relPath]) {
+              found[relPath] = true;
+              results.push({
+                path: relPath,
+                name: name + '/',
+                isDir: true,
+                detail: 'Directory'
+              });
+            }
+            walkDir(full, depth + 1);
+          } else {
+            if (match && !found[relPath]) {
+              found[relPath] = true;
+              var sizeKB = Math.round(st.size / 1024);
+              results.push({
+                path: relPath,
+                name: name,
+                isDir: false,
+                detail: sizeKB + ' KB',
+                content: st.size < 100 * 1024 ? fs.readFileSync(full, 'utf-8').substring(0, 5000) : '(file too large)'
+              });
+            }
+          }
+        } catch(e) {}
+      }
+    } catch(e) {}
+  }
+
+  try { walkDir(basePath, 0); } catch(e) {}
+
+  panel.webview.postMessage({ type: 'mentionResult', results: results.slice(0, 15) });
+}
+
+function resolveFolderMention(panel, query) {
+  var dirPath = query;
+  if (!pathModule.isAbsolute(dirPath)) {
+    dirPath = pathModule.join(workspaceRoot, dirPath);
+  }
+
+  var results = [];
+  if (!fs.existsSync(dirPath)) {
+    var dirs = [];
+    try {
+      var items = fs.readdirSync(workspaceRoot);
+      for (var i = 0; i < items.length; i++) {
+        var name = items[i];
+        if (name.startsWith('.')) continue;
+        var full = pathModule.join(workspaceRoot, name);
+        if (fs.statSync(full).isDirectory()) {
+          if (name.toLowerCase().indexOf(query.toLowerCase()) >= 0) {
+            dirs.push({
+              path: name + '/',
+              name: name + '/',
+              isDir: true,
+              detail: 'Directory'
+            });
+          }
+        }
+      }
+    } catch(e) {}
+    panel.webview.postMessage({ type: 'mentionResult', results: dirs.slice(0, 15) });
+    return;
+  }
+
+  try {
+    var entries = fs.readdirSync(dirPath);
+    for (var i = 0; i < Math.min(entries.length, 30); i++) {
+      var name = entries[i];
+      if (name.startsWith('.')) continue;
+      var full = pathModule.join(dirPath, name);
+      try {
+        var st = fs.statSync(full);
+        var relPath = pathModule.relative(workspaceRoot, full);
+        results.push({
+          path: relPath,
+          name: name + (st.isDirectory() ? '/' : ''),
+          isDir: st.isDirectory(),
+          detail: st.isDirectory() ? 'Directory' : Math.round(st.size / 1024) + ' KB'
+        });
+      } catch(e) {}
+    }
+  } catch(e) {}
+
+  panel.webview.postMessage({ type: 'mentionResult', results: results.slice(0, 20) });
+}
+
+function resolveCodebaseMention(panel, query) {
+  var results = [];
+  var pattern = query.toLowerCase();
+
+  // Phase 3: Try indexed search first
+  var indexed = searchIndexedCodebase(pattern, 10);
+  if (indexed) {
+    for (var i = 0; i < indexed.length; i++) {
+      var parts = indexed[i].split('  ');
+      results.push({
+        path: parts[0],
+        name: parts[0],
+        isDir: false,
+        detail: parts.length > 1 ? parts[1] : ''
+      });
+    }
+    panel.webview.postMessage({ type: 'mentionResult', results: results });
+    return;
+  }
+
+  // Fallback to walk
+  function walkDir(dir) {
+    if (results.length >= 10) return;
+    try {
+      var items = fs.readdirSync(dir);
+      for (var i = 0; i < items.length; i++) {
+        if (results.length >= 10) return;
+        var name = items[i];
+        if (name.startsWith('.')) continue;
+        var excludeDirs = { 'node_modules':1, '__pycache__':1, '.git':1, 'venv':1, '.venv':1, 'dist':1, 'build':1 };
+        var full = pathModule.join(dir, name);
+        try {
+          var st = fs.statSync(full);
+          if (st.isDirectory()) {
+            if (!excludeDirs[name]) walkDir(full);
+          } else {
+            if (st.size > 100 * 1024) continue;
+            var ext = pathModule.extname(name).toLowerCase();
+            if (['.png','.jpg','.gif','.zip','.exe','.dll','.so','.pyc','.bin'].indexOf(ext) >= 0) continue;
+            var content = fs.readFileSync(full, 'utf-8');
+            var lines = content.split('\n');
+            for (var j = 0; j < lines.length; j++) {
+              if (lines[j].toLowerCase().indexOf(pattern) >= 0) {
+                var relPath = pathModule.relative(workspaceRoot, full);
+                results.push({
+                  path: relPath + ':' + (j + 1),
+                  name: relPath,
+                  isDir: false,
+                  detail: 'Line ' + (j + 1) + ': ' + lines[j].trim().substring(0, 80),
+                  content: content.substring(0, 3000)
+                });
+                break;
+              }
+            }
+          }
+        } catch(e) {}
+      }
+    } catch(e) {}
+  }
+
+  try { walkDir(workspaceRoot); } catch(e) {}
+
+  panel.webview.postMessage({ type: 'mentionResult', results: results.slice(0, 10) });
+}
+
+function resolveTerminalMention(panel, query) {
+  if (!query) {
+    panel.webview.postMessage({ type: 'mentionResult', results: [] });
+    return;
+  }
+
+  try {
+    var out = cp.execSync(query, {
+      cwd: workspaceRoot || process.cwd(),
+      timeout: 15000,
+      encoding: 'utf-8',
+      maxBuffer: 100 * 1024
+    });
+    var output = out.toString();
+    if (output.length > 3000) output = output.substring(0, 3000) + '\n... (truncated)';
+
+    panel.webview.postMessage({
+      type: 'mentionResolved',
+      key: 'terminal:' + query,
+      label: '$ ' + query,
+      content: output
+    });
+  } catch (e) {
+    var errOut = e.stdout ? e.stdout.toString().substring(0, 1000) : '';
+    var errMsg = e.stderr ? e.stderr.toString().substring(0, 1000) : '';
+    panel.webview.postMessage({
+      type: 'mentionResolved',
+      key: 'terminal:' + query,
+      label: '$ ' + query + ' (exit ' + (e.status || 1) + ')',
+      content: errOut || errMsg || e.message
+    });
+  }
+}
+
+// ─── Chat with @-mentions ─────────────────────────
+
+function handleChatWithMentions(panel, message) {
+  var text = (message.text || '').trim();
+  var mentions = message.mentions || [];
+  var extraContext = '';
+
+  for (var i = 0; i < mentions.length; i++) {
+    var m = mentions[i];
+    var resolved = resolveSingleMention(m.type, m.query);
+    if (resolved) {
+      extraContext += '\n--- ' + resolved.label + ' ---\n' + resolved.content + '\n';
+    }
+  }
+
+  if (message.fileContext) {
+    extraContext = 'Context file:\n```\n' + message.fileContext + '\n```\n' + extraContext;
+  }
+
+  if (extraContext) {
+    text = '[Context]\n' + extraContext + '\n\n[User request]\n' + text;
+  }
+
   if (chatHistory.length === 0 && workspaceRoot) {
     text = '[Workspace: ' + workspaceRoot + ']\n\n' + text;
   }
 
-  // Attach file context
+  panel.webview.postMessage({ type: 'user', content: text.substring(0, 500) });
+  agentLoop(panel, text);
+}
+
+function resolveSingleMention(type, query) {
+  if (!query || !workspaceRoot) return null;
+
+  if (type === 'file') {
+    var filePath = query;
+    if (!pathModule.isAbsolute(filePath)) {
+      filePath = pathModule.join(workspaceRoot, filePath);
+    }
+    if (fs.existsSync(filePath) && !fs.statSync(filePath).isDirectory()) {
+      var content = fs.readFileSync(filePath, 'utf-8');
+      return { label: 'File: ' + pathModule.relative(workspaceRoot, filePath), content: content.substring(0, 10000) };
+    }
+    try {
+      var found = searchForFile(workspaceRoot, query);
+      if (found) {
+        var content = fs.readFileSync(found, 'utf-8');
+        return { label: 'File: ' + pathModule.relative(workspaceRoot, found), content: content.substring(0, 10000) };
+      }
+    } catch(e) {}
+    return { label: 'File: ' + query, content: '(file not found)' };
+  }
+
+  if (type === 'folder') {
+    var dirPath = query;
+    if (!pathModule.isAbsolute(dirPath)) {
+      dirPath = pathModule.join(workspaceRoot, dirPath);
+    }
+    if (fs.existsSync(dirPath)) {
+      var listing = '';
+      try {
+        var entries = fs.readdirSync(dirPath);
+        for (var i = 0; i < entries.length; i++) {
+          if (entries[i].startsWith('.')) continue;
+          listing += entries[i] + '\n';
+        }
+      } catch(e) {}
+      return { label: 'Folder: ' + query, content: listing.substring(0, 3000) };
+    }
+    return { label: 'Folder: ' + query, content: '(directory not found)' };
+  }
+
+  if (type === 'codebase') {
+    var pattern = query;
+    var searchResults = [];
+    try {
+      searchForPattern(workspaceRoot, pattern, searchResults, 0);
+    } catch(e) {}
+    var output = searchResults.length > 0
+      ? searchResults.join('\n').substring(0, 5000)
+      : 'No matches found for "' + pattern + '"';
+    return { label: 'Codebase search: ' + pattern, content: output };
+  }
+
+  if (type === 'terminal') {
+    try {
+      var out = cp.execSync(query, {
+        cwd: workspaceRoot || process.cwd(),
+        timeout: 15000,
+        encoding: 'utf-8',
+        maxBuffer: 100 * 1024
+      });
+      return { label: '$ ' + query, content: out.toString().substring(0, 3000) };
+    } catch (e) {
+      var errOut = e.stdout ? e.stdout.toString().substring(0, 1000) : '';
+      var errMsg = e.stderr ? e.stderr.toString().substring(0, 1000) : '';
+      return { label: '$ ' + query, content: errOut || errMsg || e.message };
+    }
+  }
+
+  return null;
+}
+
+function searchForFile(dir, filename) {
+  var excludeDirs = { 'node_modules':1, '__pycache__':1, '.git':1, 'venv':1, '.venv':1, 'dist':1, 'build':1 };
+  try {
+    var items = fs.readdirSync(dir);
+    for (var i = 0; i < items.length; i++) {
+      var name = items[i];
+      if (name.startsWith('.')) continue;
+      var full = pathModule.join(dir, name);
+      try {
+        var st = fs.statSync(full);
+        if (st.isDirectory()) {
+          if (!excludeDirs[name]) {
+            var found = searchForFile(full, filename);
+            if (found) return found;
+          }
+        } else {
+          if (name.indexOf(filename) >= 0 || full.indexOf(filename) >= 0) return full;
+        }
+      } catch(e) {}
+    }
+  } catch(e) {}
+  return null;
+}
+
+function searchForPattern(dir, pattern, results, depth) {
+  if (depth > 4) return;
+  var excludeDirs = { 'node_modules':1, '__pycache__':1, '.git':1, 'venv':1, '.venv':1, 'dist':1, 'build':1, '.idea':1 };
+  var excludeExts = { '.png':1, '.jpg':1, '.gif':1, '.zip':1, '.exe':1, '.dll':1, '.so':1, '.pyc':1, '.bin':1 };
+  var lowerPattern = pattern.toLowerCase();
+  try {
+    var items = fs.readdirSync(dir);
+    for (var i = 0; i < items.length; i++) {
+      if (results.length >= 10) return;
+      var name = items[i];
+      if (name.startsWith('.')) continue;
+      var full = pathModule.join(dir, name);
+      try {
+        var st = fs.statSync(full);
+        if (st.isDirectory()) {
+          if (!excludeDirs[name]) searchForPattern(full, pattern, results, depth + 1);
+        } else {
+          var ext = pathModule.extname(name).toLowerCase();
+          if (excludeExts[ext]) continue;
+          if (st.size > 100 * 1024) continue;
+          var content = fs.readFileSync(full, 'utf-8');
+          var lines = content.split('\n');
+          for (var j = 0; j < lines.length; j++) {
+            if (lines[j].toLowerCase().indexOf(lowerPattern) >= 0) {
+              var relPath = pathModule.relative(workspaceRoot, full);
+              results.push(relPath + ':' + (j + 1) + '  ' + lines[j].trim().substring(0, 100));
+              break;
+            }
+          }
+        }
+      } catch(e) {}
+    }
+  } catch(e) {}
+}
+
+// ─── Slash command executor ───────────────────────
+
+function handleRunCommand(panel, message) {
+  var cmd = message.command || '';
+  var args = message.args || '';
+
+  switch (cmd) {
+    case 'edit':
+      handleEditCommand(panel, args);
+      break;
+    case 'commit':
+      handleCommitCommand(panel);
+      break;
+    case 'test':
+      handleTestCommand(panel, args);
+      break;
+    case 'explain':
+      handleExplainCommand(panel, args);
+      break;
+    case 'so':
+      handleSoCommand(panel, args);
+      break;
+    default:
+      panel.webview.postMessage({ type: 'error', content: 'Unknown command: /' + cmd });
+      break;
+  }
+}
+
+function handleEditCommand(panel, instructions) {
+  var editor = vscode.window.activeTextEditor;
+  if (!editor) {
+    panel.webview.postMessage({ type: 'error', content: 'No editor open. Open a file to use /edit.' });
+    return;
+  }
+
+  var doc = editor.document;
+  var sel = editor.selection;
+  var selectedText = sel.isEmpty ? doc.getText() : doc.getText(sel);
+  var lang = doc.languageId || 'text';
+
+  var editPrompt = 'Edit the following code as instructed. Return ONLY the complete, updated file content in a code block.\n\n'
+    + 'Language: ' + lang + '\n'
+    + 'File: ' + doc.fileName + '\n'
+    + 'Instructions: ' + (instructions || 'Please improve this code') + '\n\n'
+    + 'Current code:\n```\n' + selectedText + '\n```\n\n'
+    + 'Return the complete updated code in a ```' + lang + ' ... ``` block.';
+
+  panel.webview.postMessage({ type: 'user', content: '/edit ' + (instructions || '(improve code)') });
+  agentLoop(panel, editPrompt);
+}
+
+function handleCommitCommand(panel) {
+  if (!workspaceRoot) {
+    panel.webview.postMessage({ type: 'error', content: 'No workspace open. Open a project to use /commit.' });
+    return;
+  }
+
+  try {
+    var diff = cp.execSync('git diff --cached', { cwd: workspaceRoot, timeout: 10000, encoding: 'utf-8' });
+    var diffOut = diff.toString().trim();
+    if (!diffOut) {
+      diff = cp.execSync('git diff', { cwd: workspaceRoot, timeout: 10000, encoding: 'utf-8' });
+      diffOut = diff.toString().trim();
+    }
+    if (!diffOut) {
+      panel.webview.postMessage({ type: 'error', content: 'No staged or unstaged changes found.' });
+      return;
+    }
+
+    var commitPrompt = 'Generate a concise, conventional git commit message for the following diff.\n'
+      + 'Format: type(scope): short description\n\n'
+      + 'Diff:\n```diff\n' + diffOut.substring(0, 5000) + '\n```\n\n'
+      + 'Return ONLY the commit message, nothing else.';
+
+    panel.webview.postMessage({ type: 'user', content: '/commit (generating commit message...)' });
+    agentLoop(panel, commitPrompt);
+  } catch (e) {
+    panel.webview.postMessage({ type: 'error', content: 'Git error: ' + (e.message || 'not a git repo?') });
+  }
+}
+
+function handleTestCommand(panel, args) {
+  var editor = vscode.window.activeTextEditor;
+  if (!editor) {
+    panel.webview.postMessage({ type: 'error', content: 'Open a file with code to test.' });
+    return;
+  }
+
+  var doc = editor.document;
+  var sel = editor.selection;
+  var selectedText = sel.isEmpty ? doc.getText() : doc.getText(sel);
+  var lang = doc.languageId || 'text';
+
+  var testPrompt = 'Generate comprehensive unit tests for the following code.\n'
+    + 'Language: ' + lang + '\n'
+    + (args ? 'Additional instructions: ' + args + '\n' : '')
+    + 'Code:\n```\n' + selectedText.substring(0, 5000) + '\n```\n\n'
+    + 'Return the tests in a ```' + lang + ' ... ``` code block. Include edge cases.';
+
+  panel.webview.postMessage({ type: 'user', content: '/test ' + (args || '(generate tests)') });
+  agentLoop(panel, testPrompt);
+}
+
+function handleExplainCommand(panel, args) {
+  var editor = vscode.window.activeTextEditor;
+  if (!editor) {
+    panel.webview.postMessage({ type: 'error', content: 'Open a file to explain.' });
+    return;
+  }
+
+  var doc = editor.document;
+  var sel = editor.selection;
+  var selectedText = sel.isEmpty ? doc.getText() : doc.getText(sel);
+  var lang = doc.languageId || 'code';
+
+  var explainPrompt = 'Explain the following ' + lang + ' code in detail:\n\n```\n'
+    + selectedText.substring(0, 5000) + '\n```\n\n'
+    + 'Answer in clear language. Cover: what each part does, the overall algorithm, '
+    + 'any design patterns used, and potential issues.';
+
+  panel.webview.postMessage({ type: 'user', content: '/explain' });
+  agentLoop(panel, explainPrompt);
+}
+
+function handleSoCommand(panel, args) {
+  if (!args) {
+    panel.webview.postMessage({ type: 'error', content: 'Please add a search query. Usage: /so how to sort array in Python' });
+    return;
+  }
+
+  var soPrompt = 'The user wants to know: "' + args + '"\n\n'
+    + 'Search your knowledge and provide the best answer, including code examples where relevant. '
+    + 'Format it like a helpful Stack Overflow answer with explanation and code.';
+
+  panel.webview.postMessage({ type: 'user', content: '/so ' + args });
+  agentLoop(panel, soPrompt);
+}
+
+function handleChat(panel, message) {
+  var text = (message.text || '').trim();
+  if (!text) return;
+
+  if (chatHistory.length === 0 && workspaceRoot) {
+    text = '[Workspace: ' + workspaceRoot + ']\n\n' + text;
+  }
+
   if (message.fileContext) {
     text = 'Context file:\n```\n' + message.fileContext + '\n```\n\nUser request:\n' + text;
   }
 
-  // Show user message
   panel.webview.postMessage({ type: 'user', content: text.substring(0, 500) });
-
   agentLoop(panel, text);
 }
 
 function attachCurrentFile(panel) {
   var editor = vscode.window.activeTextEditor;
   if (!editor) {
-    panel.webview.postMessage({ type: 'status', text: '没有打开的文件' });
+    panel.webview.postMessage({ type: 'status', text: 'No file open' });
     return;
   }
   var doc = editor.document;
@@ -557,8 +1437,8 @@ function attachCurrentFile(panel) {
   var hasSel = !sel.isEmpty;
   var content = hasSel ? doc.getText(sel) : doc.getText();
   var lbl = hasSel
-    ? '已选中: ' + doc.fileName.split(/[/\\]/).pop() + ' (' + content.split('\n').length + ' 行)'
-    : '已附加: ' + doc.fileName.split(/[/\\]/).pop();
+    ? 'Selected: ' + doc.fileName.split(/[/\\]/).pop() + ' (' + content.split('\n').length + ' lines)'
+    : 'Attached: ' + doc.fileName.split(/[/\\]/).pop();
 
   panel.webview.postMessage({
     type: 'contextSet',
@@ -571,11 +1451,48 @@ function attachCurrentFile(panel) {
 
 function activate(context) {
   extensionContext = context;
-  console.log('Win7 AI Coder v3 (Agent Mode) activated');
+  console.log('Win7 AI Coder v5 activated');
 
-  // Detect workspace
   if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
     workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
+  }
+
+  // Phase 3: Build codebase index on activation
+  if (workspaceRoot) {
+    var loaded = loadCodebaseIndex();
+    if (!loaded) {
+      // Build asynchronously (don't block activation)
+      setTimeout(function() {
+        saveCodebaseIndex();
+      }, 2000);
+    }
+
+    // Rebuild on file save
+    context.subscriptions.push(
+      vscode.workspace.onDidSaveTextDocument(function(doc) {
+        var cfg = getConfig();
+        if (cfg.enableInlineCompletion) {
+          // Debounced rebuild
+          if (codebaseIndexRebuildTimer) clearTimeout(codebaseIndexRebuildTimer);
+          codebaseIndexRebuildTimer = setTimeout(function() {
+            saveCodebaseIndex();
+            codebaseIndexRebuildTimer = null;
+          }, 5000);
+        }
+      })
+    );
+  }
+
+  // Phase 2: Register inline completion provider
+  var cfg = getConfig();
+  if (cfg.enableInlineCompletion) {
+    context.subscriptions.push(
+      vscode.languages.registerInlineCompletionItemProvider(
+        { pattern: '**' },
+        new InlineCompletionProvider()
+      )
+    );
+    console.log('[Win7 AI] Inline completion provider registered');
   }
 
   // Commands
@@ -590,14 +1507,14 @@ function activate(context) {
       var panel = openChatPanel(context);
       var editor = vscode.window.activeTextEditor;
       if (!editor || editor.selection.isEmpty) {
-        vscode.window.showWarningMessage('请先选中代码。');
+        vscode.window.showWarningMessage('Select code first.');
         return;
       }
       var sel = editor.document.getText(editor.selection);
       panel.webview.postMessage({
         type: 'contextSet',
         fileContent: sel,
-        label: '已选中: ' + editor.document.fileName.split(/[/\\]/).pop()
+        label: 'Selected: ' + editor.document.fileName.split(/[/\\]/).pop()
       });
     })
   );
@@ -608,14 +1525,13 @@ function activate(context) {
       var editor = vscode.window.activeTextEditor;
       if (!editor) return;
       var content = editor.document.getText();
-      var lang = editor.document.languageId || 'code';
       panel.webview.postMessage({
         type: 'contextSet',
         fileContent: content,
-        label: '剖析: ' + editor.document.fileName.split(/[/\\]/).pop()
+        label: 'File: ' + editor.document.fileName.split(/[/\\]/).pop()
       });
       handleChat(panel, {
-        text: '请详细分析项目结构，解释每个文件的作用和它们之间的关系。',
+        text: 'Analyze the project structure, explain each file and their relationships.',
         fileContext: content
       });
     })
@@ -649,7 +1565,7 @@ function activate(context) {
     })
   );
 
-  // Listen for workspace changes
+  // Workspace changes
   context.subscriptions.push(
     vscode.workspace.onDidChangeWorkspaceFolders(function(e) {
       if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
@@ -657,7 +1573,27 @@ function activate(context) {
       }
     })
   );
+
+  // Phase 4: Register rebuild index command
+  context.subscriptions.push(
+    vscode.commands.registerCommand('win7-ai-coder.rebuildIndex', function() {
+      saveCodebaseIndex();
+      vscode.window.showInformationMessage('Codebase index rebuilt: ' + Object.keys(codebaseIndex.files).length + ' files');
+    })
+  );
+
+  // Phase 4: Register toggle inline completion command
+  context.subscriptions.push(
+    vscode.commands.registerCommand('win7-ai-coder.toggleInlineCompletion', function() {
+      var cfg2 = vscode.workspace.getConfiguration('win7-ai-coder');
+      var current = cfg2.get('enableInlineCompletion', true);
+      cfg2.update('enableInlineCompletion', !current, vscode.ConfigurationTarget.Global);
+      vscode.window.showInformationMessage('Inline completion: ' + (!current ? 'ON' : 'OFF'));
+    })
+  );
 }
+
+var codebaseIndexRebuildTimer = null;
 
 function openChatPanel(context) {
   if (chatPanel) {

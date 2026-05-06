@@ -1,8 +1,7 @@
 {
   "name": "win7-ai-coder",
   "displayName": "Win7 AI Coder",
-  "description": "AI coding assistant powered by local DeepSeek models — works on Windows 7 / VSCode 1.69",
-  "version": "2.0.0",
+  "description": "AI coding assistant with @-mentions, slash commands, and agent loop — works on Windows 7 / VSCode 1.69",
   "publisher": "win7-ai",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -18,6 +17,7 @@
     "Programming Languages",
     "Other"
   ],
+  "version": "5.0.0",
   "keywords": [
     "ai",
     "deepseek",
@@ -31,6 +31,8 @@
     "onCommand:win7-ai-coder.askSelection",
     "onCommand:win7-ai-coder.explainCode",
     "onCommand:win7-ai-coder.generateDocs",
+    "onCommand:win7-ai-coder.rebuildIndex",
+    "onCommand:win7-ai-coder.toggleInlineCompletion",
     "onView:win7-ai-coder.chatView"
   ],
   "main": "./extension.js",
@@ -56,6 +58,14 @@
       {
         "command": "win7-ai-coder.clearChat",
         "title": "AI Chat: Clear Chat History"
+      },
+      {
+        "command": "win7-ai-coder.rebuildIndex",
+        "title": "AI Chat: Rebuild Codebase Index"
+      },
+      {
+        "command": "win7-ai-coder.toggleInlineCompletion",
+        "title": "AI Chat: Toggle Inline Completion"
       }
     ],
     "menus": {
@@ -105,7 +115,10 @@
         "win7-ai-coder.provider": {
           "type": "string",
           "default": "openai",
-          "enum": ["openai", "ollama"],
+          "enum": [
+            "openai",
+            "ollama"
+          ],
           "description": "LLM API format"
         },
         "win7-ai-coder.openaiBaseUrl": {
@@ -149,6 +162,23 @@
           "type": "boolean",
           "default": true,
           "description": "Stream responses token-by-token"
+        },
+        "win7-ai-coder.enableInlineCompletion": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable Tab autocomplete while typing (requires model API)"
+        },
+        "win7-ai-coder.inlineCompletionDebounce": {
+          "type": "number",
+          "default": 400,
+          "minimum": 100,
+          "maximum": 2000,
+          "description": "Debounce delay (ms) before inline completion requests"
+        },
+        "win7-ai-coder.enableCodebaseIndex": {
+          "type": "boolean",
+          "default": true,
+          "description": "Build and use codebase keyword index for faster @codebase search"
         }
       }
     }
