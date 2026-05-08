@@ -801,18 +801,49 @@ function getWebviewHTML(webview) {
 '</head>\n' +
 '<body>\n' +
 '  <div id="container">\n' +
+'    <!-- Header with dropdown menu -->\n' +
 '    <div id="header">\n' +
-'      <span class="header-title">\u{1F916} AI Agent</span>\n' +
+'      <div class="header-left">\n' +
+'        <span class="header-title">\u{1F916} AI Agent</span>\n' +
+'      </div>\n' +
 '      <div class="header-actions">\n' +
-'        <button id="btn-clear" class="icon-btn" title="Clear">\u{1F5D1}</button>\n' +
+'        <button id="btn-clear" class="icon-btn" title="Clear conversation">\u{1F5D1}</button>\n' +
 '        <button id="btn-config" class="icon-btn" title="Attach file">\u{1F4CE}</button>\n' +
+'        <button id="btn-menu" class="icon-btn" title="Menu">\u{22EF}</button>\n' +
+'      </div>\n' +
+'      <!-- Dropdown menu -->\n' +
+'      <div id="header-dropdown">\n' +
+'        <div id="dd-new-session" class="dropdown-item">\n' +
+'          <span class="dropdown-icon">\u{2795}</span>\n' +
+'          <span class="dropdown-label">New Session</span>\n' +
+'        </div>\n' +
+'        <div id="dd-settings" class="dropdown-item">\n' +
+'          <span class="dropdown-icon">\u{2699}\uFE0F</span>\n' +
+'          <span class="dropdown-label">Settings</span>\n' +
+'          <span class="dropdown-shortcut">Ctrl+,</span>\n' +
+'        </div>\n' +
+'        <div id="dd-history" class="dropdown-item">\n' +
+'          <span class="dropdown-icon">\u{1F4CB}</span>\n' +
+'          <span class="dropdown-label">History</span>\n' +
+'          <span class="dropdown-shortcut">Ctrl+H</span>\n' +
+'        </div>\n' +
+'        <div id="dd-rebuild" class="dropdown-item">\n' +
+'          <span class="dropdown-icon">\u{1F504}</span>\n' +
+'          <span class="dropdown-label">Rebuild Index</span>\n' +
+'        </div>\n' +
+'        <div id="dd-clear-all" class="dropdown-item">\n' +
+'          <span class="dropdown-icon">\u{1F5D1}\uFE0F</span>\n' +
+'          <span class="dropdown-label">Clear All</span>\n' +
+'        </div>\n' +
 '      </div>\n' +
 '    </div>\n' +
+'\n' +
+'    <!-- Messages area -->\n' +
 '    <div id="messages">\n' +
 '      <div class="welcome">\n' +
 '        <div class="welcome-icon">\u{1F916}</div>\n' +
 '        <div class="welcome-title">Win7 AI Coder v5</div>\n' +
-'        <div class="welcome-sub">@-mentions · /commands · Tab autocomplete · Codebase index</div>\n' +
+'        <div class="welcome-sub">@-mentions \u00B7 /commands \u00B7 Tab autocomplete \u00B7 Codebase index</div>\n' +
 '        <div class="welcome-hints">\n' +
 '          <div class="hint"><span class="hint-key">@</span> Attach files, search codebase, or run terminal commands</div>\n' +
 '          <div class="hint"><span class="hint-key">/</span> Quick commands: /edit, /commit, /test, /explain, /clear</div>\n' +
@@ -820,21 +851,113 @@ function getWebviewHTML(webview) {
 '        </div>\n' +
 '      </div>\n' +
 '    </div>\n' +
+'\n' +
+'    <!-- Input area with context, progress, thinking -->\n' +
 '    <div id="input-area">\n' +
+'      <!-- Context bar -->\n' +
 '      <div id="context-bar" style="display:none;">\n' +
 '        <span id="context-label"></span>\n' +
 '        <button id="btn-remove-context" class="small-btn">&times;</button>\n' +
 '      </div>\n' +
+'      <!-- Context progress (Continue-style) -->\n' +
+'      <div id="context-progress" class="context-progress">\n' +
+'        <div class="context-progress-bar">\n' +
+'          <div id="context-progress-fill" class="context-progress-fill"></div>\n' +
+'        </div>\n' +
+'        <span id="context-progress-label" class="context-progress-label"></span>\n' +
+'      </div>\n' +
+'      <!-- Thinking indicator -->\n' +
 '      <div id="thinking-indicator" style="display:none;" class="thinking-bar">\n' +
 '        <span class="thinking-spinner">\u23F3</span>\n' +
 '        <span id="thinking-text" class="thinking-text">Thinking...</span>\n' +
 '      </div>\n' +
+'      <!-- Input row -->\n' +
 '      <div id="input-row">\n' +
 '        <textarea id="input" rows="2" placeholder="Ask me to read, write, search, or run anything... (Enter to send)"></textarea>\n' +
 '        <button id="btn-send" class="send-btn" disabled>\u25B6</button>\n' +
 '      </div>\n' +
 '    </div>\n' +
+'\n' +
+'    <!-- Status bar (Continue-style) -->\n' +
+'    <div id="status-bar">\n' +
+'      <div class="status-left">\n' +
+'        <span class="status-item model-select" id="status-model">No model</span>\n' +
+'      </div>\n' +
+'      <div class="status-right">\n' +
+'        <span class="status-item">\n' +
+'          <span id="status-dot" class="status-dot connected"></span>\n' +
+'        </span>\n' +
+'        <span class="status-item">\n' +
+'          <span id="status-tokens" class="token-count">0</span> tokens\n' +
+'        </span>\n' +
+'      </div>\n' +
+'    </div>\n' +
 '  </div>\n' +
+'\n' +
+'  <!-- Settings panel (slide-out, Continue-style) -->\n' +
+'  <div id="settings-overlay"></div>\n' +
+'  <div id="settings-panel">\n' +
+'    <div class="settings-header">\n' +
+'      <span>Settings</span>\n' +
+'      <button id="settings-close" class="settings-close">&times;</button>\n' +
+'    </div>\n' +
+'    <div class="settings-body">\n' +
+'      <div class="settings-group">\n' +
+'        <div class="settings-group-label">Model</div>\n' +
+'        <div class="settings-row">\n' +
+'          <label>Provider</label>\n' +
+'          <select id="settings-model">\n' +
+'            <option value="openai">OpenAI GPT-4</option>\n' +
+'            <option value="gpt35">GPT-3.5 Turbo</option>\n' +
+'            <option value="claude">Claude 3.5 Sonnet</option>\n' +
+'            <option value="local">Local (Ollama)</option>\n' +
+'            <option value="custom">Custom Endpoint</option>\n' +
+'          </select>\n' +
+'        </div>\n' +
+'      </div>\n' +
+'      <div class="settings-group">\n' +
+'        <div class="settings-group-label">API</div>\n' +
+'        <div class="settings-row">\n' +
+'          <label>API Key</label>\n' +
+'          <input type="text" id="settings-apikey" placeholder="sk-..." />\n' +
+'        </div>\n' +
+'      </div>\n' +
+'      <div class="settings-group">\n' +
+'        <div class="settings-group-label">Generation</div>\n' +
+'        <div class="settings-row">\n' +
+'          <label>Temperature</label>\n' +
+'          <input type="range" id="settings-temp" min="0" max="2" step="0.1" value="0.7" />\n' +
+'          <span id="settings-temp-val" class="range-value">0.7</span>\n' +
+'        </div>\n' +
+'        <div class="settings-row">\n' +
+'          <label>Max Tokens</label>\n' +
+'          <input type="number" id="settings-max-tokens" value="4096" min="256" max="32768" />\n' +
+'        </div>\n' +
+'      </div>\n' +
+'    </div>\n' +
+'    <div class="settings-footer">\n' +
+'      <button id="settings-cancel" class="settings-btn secondary">Cancel</button>\n' +
+'      <button id="settings-save" class="settings-btn">Save</button>\n' +
+'    </div>\n' +
+'  </div>\n' +
+'\n' +
+'  <!-- History sidebar (slide-out, Continue-style) -->\n' +
+'  <div id="history-sidebar">\n' +
+'    <div class="history-header">\n' +
+'      <span>Session History</span>\n' +
+'      <button id="history-close" class="history-close">&times;</button>\n' +
+'    </div>\n' +
+'    <div class="history-search">\n' +
+'      <input id="history-search-input" type="text" placeholder="Search sessions..." />\n' +
+'    </div>\n' +
+'    <div id="history-list" class="history-list">\n' +
+'      <div class="history-empty">No past sessions yet</div>\n' +
+'    </div>\n' +
+'    <div class="history-footer">\n' +
+'      <button id="history-clear-btn">Clear all sessions</button>\n' +
+'    </div>\n' +
+'  </div>\n' +
+'\n' +
 '  <script src="' + jsUri + '"></script>\n' +
 '</body>\n' +
 '</html>';
