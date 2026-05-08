@@ -1,7 +1,7 @@
 {
   "name": "win7-ai-coder",
   "displayName": "Win7 AI Coder",
-  "description": "AI coding assistant with @-mentions, slash commands, and agent loop — works on Windows 7 / VSCode 1.69",
+  "description": "Continue-style AI coding assistant for Windows 7 — @-mentions, slash commands, tab autocomplete, codebase index, session history, settings panel, diff preview — works on VSCode 1.69",
   "publisher": "win7-ai",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -17,7 +17,7 @@
     "Programming Languages",
     "Other"
   ],
-  "version": "5.0.1",
+  "version": "6.0.0",
   "keywords": [
     "ai",
     "deepseek",

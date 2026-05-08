@@ -112,6 +112,553 @@ var SYSTEM_PROMPT = (
   + '- Keep responses professional and helpful.'
 );
 
+// ─── 设置存储/读取 ─────────────────────────────────
+
+var currentSessionId = null;
+var sessionsList = [];
+
+function handleSaveSettings(panel, message) {
+  try {
+    var cfg = message.config || {};
+    var vscfg = vscode.workspace.getConfiguration('win7-ai-coder');
+    if (cfg.model) vscfg.update('openaiModel', cfg.model, vscode.ConfigurationTarget.Global);
+    if (cfg.apiKey !== undefined) vscfg.update('openaiApiKey', cfg.apiKey, vscode.ConfigurationTarget.Global);
+    if (cfg.temperature !== undefined) vscfg.update('temperature', cfg.temperature, vscode.ConfigurationTarget.Global);
+    if (cfg.maxTokens !== undefined) vscfg.update('maxTokens', cfg.maxTokens, vscode.ConfigurationTarget.Global);
+    if (cfg.provider) vscfg.update('provider', cfg.provider, vscode.ConfigurationTarget.Global);
+    if (cfg.baseUrl) vscfg.update('openaiBaseUrl', cfg.baseUrl, vscode.ConfigurationTarget.Global);
+    panel.webview.postMessage({ type: 'status', text: 'Settings saved' });
+  } catch (e) {
+    console.log('[Win7 AI] Error saving settings: ' + e.message);
+  }
+}
+
+function handleLoadSettings(panel) {
+  try {
+    var cfg = vscode.workspace.getConfiguration('win7-ai-coder');
+    panel.webview.postMessage({
+      type: 'config',
+      model: cfg.get('openaiModel', 'deepseek-chat'),
+      ws: workspaceRoot || '(no workspace)',
+      inlineComplete: cfg.get('enableInlineCompletion', true),
+      provider: cfg.get('provider', 'openai'),
+      apiKey: cfg.get('openaiApiKey', ''),
+      temperature: cfg.get('temperature', 0.0),
+      maxTokens: cfg.get('maxTokens', 8192),
+      baseUrl: cfg.get('openaiBaseUrl', 'http://localhost:8080/v1')
+    });
+  } catch (e) {
+    console.log('[Win7 AI] Error loading settings: ' + e.message);
+  }
+}
+
+// ─── 对话历史存储 ─────────────────────────────────
+
+function getSessionsStorageKey() {
+  return 'win7-ai-coder-sessions-v2';
+}
+
+function loadSessionsFromStorage() {
+  try {
+    if (!extensionContext) return [];
+    var data = extensionContext.globalState.get(getSessionsStorageKey(), []);
+    if (Array.isArray(data)) {
+      sessionsList = data;
+    }
+  } catch (e) {
+    console.log('[Win7 AI] Error loading sessions: ' + e.message);
+    sessionsList = [];
+  }
+  return sessionsList;
+}
+
+function saveSessionsToStorage() {
+  try {
+    if (!extensionContext) return;
+    extensionContext.globalState.update(getSessionsStorageKey(), sessionsList);
+  } catch (e) {
+    console.log('[Win7 AI] Error saving sessions: ' + e.message);
+  }
+}
+
+function handleNewSession(panel) {
+  // Save current session before clearing
+  saveCurrentSession();
+  chatHistory = [];
+  currentSessionId = null;
+  panel.webview.postMessage({ type: 'cleared' });
+  sendSessionsList(panel);
+}
+
+function handleLoadSession(panel, message) {
+  try {
+    var sessionId = message.sessionId;
+    if (!sessionId) return;
+
+    // Save current session first
+    saveCurrentSession();
+
+    // Find the session
+    var session = null;
+    for (var i = 0; i < sessionsList.length; i++) {
+      if (sessionsList[i].sessionId === sessionId) {
+        session = sessionsList[i];
+        break;
+      }
+    }
+
+    if (!session) {
+      panel.webview.postMessage({ type: 'error', content: 'Session not found' });
+      return;
+    }
+
+    // Restore messages
+    var msgs = session.messages || [];
+    chatHistory = msgs.slice(); // Copy the array
+
+    currentSessionId = sessionId;
+
+    // Replay messages in the UI
+    panel.webview.postMessage({ type: 'cleared' });
+    for (var j = 0; j < msgs.length; j++) {
+      var m = msgs[j];
+      if (m.role === 'user') {
+        panel.webview.postMessage({ type: 'user', content: (m.content || '').substring(0, 500) });
+      } else if (m.role === 'assistant') {
+        panel.webview.postMessage({ type: 'assistant', content: m.content || '' });
+      }
+    }
+    sendSessionsList(panel);
+  } catch (e) {
+    console.log('[Win7 AI] Error loading session: ' + e.message);
+  }
+}
+
+function handleClearSessions(panel) {
+  try {
+    sessionsList = [];
+    saveSessionsToStorage();
+    sendSessionsList(panel);
+    panel.webview.postMessage({ type: 'status', text: 'All sessions cleared' });
+  } catch (e) {
+    console.log('[Win7 AI] Error clearing sessions: ' + e.message);
+  }
+}
+
+function handleDeleteSession(panel, message) {
+  try {
+    var sessionId = message.sessionId;
+    if (!sessionId) return;
+
+    sessionsList = sessionsList.filter(function(s) {
+      return s.sessionId !== sessionId;
+    });
+    saveSessionsToStorage();
+    sendSessionsList(panel);
+  } catch (e) {
+    console.log('[Win7 AI] Error deleting session: ' + e.message);
+  }
+}
+
+function saveCurrentSession() {
+  try {
+    // Don't save empty sessions
+    var userMessages = chatHistory.filter(function(m) { return m.role === 'user'; });
+    if (userMessages.length === 0) return;
+
+    if (!currentSessionId) {
+      currentSessionId = generateSessionId();
+    }
+
+    // Generate a title from the first user message
+    var title = '';
+    if (userMessages.length > 0) {
+      title = userMessages[0].content || 'New Session';
+      if (title.length > 50) title = title.substring(0, 50) + '...';
+    }
+
+    var existing = null;
+    for (var i = 0; i < sessionsList.length; i++) {
+      if (sessionsList[i].sessionId === currentSessionId) {
+        existing = sessionsList[i];
+        break;
+      }
+    }
+
+    var sessionData = {
+      sessionId: currentSessionId,
+      title: title,
+      date: new Date().toISOString(),
+      messages: chatHistory.slice(),
+      messageCount: chatHistory.length
+    };
+
+    if (existing) {
+      // Update in place
+      for (var k = 0; k < sessionsList.length; k++) {
+        if (sessionsList[k].sessionId === currentSessionId) {
+          sessionsList[k] = sessionData;
+          break;
+        }
+      }
+    } else {
+      sessionsList.unshift(sessionData); // Add to front
+    }
+
+    saveSessionsToStorage();
+  } catch (e) {
+    console.log('[Win7 AI] Error saving current session: ' + e.message);
+  }
+}
+
+function generateSessionId() {
+  var chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  var id = 's_';
+  for (var i = 0; i < 16; i++) {
+    id += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return id;
+}
+
+function sendSessionsList(panel) {
+  try {
+    var list = sessionsList.map(function(s) {
+      return {
+        sessionId: s.sessionId,
+        title: s.title || 'Untitled session',
+        date: s.date || new Date().toISOString(),
+        messageCount: s.messageCount || 0
+      };
+    });
+    panel.webview.postMessage({
+      type: 'sessions',
+      sessions: list,
+      currentSessionId: currentSessionId
+    });
+  } catch (e) {
+    console.log('[Win7 AI] Error sending sessions list: ' + e.message);
+  }
+}
+
+// ─── Diff 应用 ─────────────────────────────────────
+
+function handleAcceptDiff(panel, message) {
+  try {
+    var filePath = message.filePath;
+    if (!filePath) return;
+
+    var resolvedPath = resolvePath(filePath);
+    if (!fs.existsSync(resolvedPath)) {
+      panel.webview.postMessage({ type: 'error', content: 'File not found: ' + filePath });
+      return;
+    }
+
+    vscode.workspace.openTextDocument(resolvedPath).then(function(doc) {
+      vscode.window.showTextDocument(doc).then(function(editor) {
+        var docText = doc.getText();
+        var lastAssistant = null;
+        for (var i = chatHistory.length - 1; i >= 0; i--) {
+          if (chatHistory[i].role === 'assistant') {
+            lastAssistant = chatHistory[i];
+            break;
+          }
+        }
+        if (!lastAssistant || !lastAssistant.content) return;
+
+        // Try to extract code blocks from assistant content
+        var content = lastAssistant.content;
+        // Find fenced code block matching the file's language
+        var lines = content.split('\n');
+        var inBlock = false;
+        var blockContent = '';
+        for (var j = 0; j < lines.length; j++) {
+          var line = lines[j];
+          if (/^```/.test(line)) {
+            if (inBlock) {
+              // End of block - this is the replacement content
+              var edit = new vscode.WorkspaceEdit();
+              var fullRange = new vscode.Range(
+                doc.positionAt(0),
+                doc.positionAt(docText.length)
+              );
+              edit.replace(doc.uri, fullRange, blockContent);
+              vscode.workspace.applyEdit(edit);
+              panel.webview.postMessage({ type: 'status', text: 'Applied: ' + filePath });
+              inBlock = false;
+              blockContent = '';
+              break;
+            } else {
+              inBlock = true;
+              blockContent = '';
+            }
+            continue;
+          }
+          if (inBlock) {
+            blockContent += line + '\n';
+          }
+        }
+      });
+    });
+  } catch (e) {
+    console.log('[Win7 AI] Error accepting diff: ' + e.message);
+  }
+}
+
+function handleRejectDiff(panel, message) {
+  panel.webview.postMessage({ type: 'status', text: 'Changes rejected for: ' + (message.filePath || '') });
+}
+
+// ─── Context Provider 系统 ───────────────────────
+
+var contextProviders = [];
+
+function registerContextProvider(name, displayName, description, handler) {
+  contextProviders.push({
+    name: name,
+    displayName: displayName,
+    description: description,
+    handler: handler
+  });
+}
+
+function getContextProvider(name) {
+  for (var i = 0; i < contextProviders.length; i++) {
+    if (contextProviders[i].name === name) {
+      return contextProviders[i];
+    }
+  }
+  return null;
+}
+
+function getAllContextProviders() {
+  return contextProviders.slice();
+}
+
+// Register built-in context providers
+function initContextProviders() {
+  // Git diff provider
+  registerContextProvider(
+    'diff',
+    'Git Diff',
+    'Reference the current git diff (staged + unstaged changes)',
+    function(query) {
+      try {
+        if (!workspaceRoot) return null;
+        var diff = cp.execSync('git diff --no-color', {
+          cwd: workspaceRoot,
+          timeout: 10000,
+          encoding: 'utf-8',
+          maxBuffer: 500 * 1024
+        });
+        var diffOut = diff.toString().trim();
+        if (!diffOut) {
+          // Try staged diff
+          diff = cp.execSync('git diff --cached --no-color', {
+            cwd: workspaceRoot,
+            timeout: 10000,
+            encoding: 'utf-8',
+            maxBuffer: 500 * 1024
+          });
+          diffOut = diff.toString().trim();
+        }
+        if (!diffOut) return { label: 'Git Diff', content: 'Git shows no current changes.' };
+        return { label: 'Git Diff', content: '```diff\n' + diffOut.substring(0, 10000) + '\n```' };
+      } catch (e) {
+        return { label: 'Git Diff', content: '(not a git repository or git not available)' };
+      }
+    }
+  );
+
+  // Open Tabs provider
+  registerContextProvider(
+    'open',
+    'Open Tabs',
+    'Reference the contents of currently open editor tabs',
+    function(query) {
+      try {
+        var tabs = vscode.window.tabGroups.all;
+        var openFiles = [];
+        for (var g = 0; g < tabs.length; g++) {
+          var group = tabs[g];
+          var tabsInGroup = group.tabs;
+          for (var t = 0; t < tabsInGroup.length; t++) {
+            var tab = tabsInGroup[t];
+            if (tab.input && tab.input.uri) {
+              var fp = tab.input.uri.fsPath;
+              if (fp && openFiles.indexOf(fp) < 0) {
+                openFiles.push(fp);
+              }
+            }
+          }
+        }
+        // Also check visible text editors
+        var editors = vscode.window.visibleTextEditors;
+        for (var e = 0; e < editors.length; e++) {
+          var ed = editors[e];
+          if (ed.document && ed.document.uri) {
+            var fp2 = ed.document.uri.fsPath;
+            if (fp2 && openFiles.indexOf(fp2) < 0) {
+              openFiles.push(fp2);
+            }
+          }
+        }
+
+        if (openFiles.length === 0) return { label: 'Open Tabs', content: '(no open files)' };
+
+        var output = '';
+        for (var i = 0; i < openFiles.length && i < 5; i++) {
+          try {
+            var relPath = workspaceRoot
+              ? pathModule.relative(workspaceRoot, openFiles[i])
+              : openFiles[i];
+            var content = fs.readFileSync(openFiles[i], 'utf-8');
+            output += '```' + relPath + '\n' + content.substring(0, 3000) + '\n```\n\n';
+          } catch (readErr) {
+            output += '```\n' + openFiles[i] + ': (unable to read)\n```\n\n';
+          }
+        }
+
+        return { label: 'Open Tabs (' + openFiles.length + ' files)', content: output || '(empty)' };
+      } catch (e) {
+        return { label: 'Open Tabs', content: '(error: ' + e.message + ')' };
+      }
+    }
+  );
+
+  // Terminal provider (already exists as @terminal - but also register as context provider)
+  registerContextProvider(
+    'terminal',
+    'Terminal',
+    'Run a terminal command and get its output',
+    function(query) {
+      if (!query) return null;
+      try {
+        var out = cp.execSync(query, {
+          cwd: workspaceRoot || process.cwd(),
+          timeout: 15000,
+          encoding: 'utf-8',
+          maxBuffer: 100 * 1024
+        });
+        return { label: '$ ' + query, content: out.toString().substring(0, 3000) };
+      } catch (e) {
+        var errOut = e.stdout ? e.stdout.toString().substring(0, 1000) : '';
+        var errMsg = e.stderr ? e.stderr.toString().substring(0, 1000) : '';
+        return { label: '$ ' + query + ' (exit ' + (e.status || 1) + ')', content: errOut || errMsg || e.message };
+      }
+    }
+  );
+
+  // Problems provider
+  registerContextProvider(
+    'problems',
+    'Problems',
+    'Reference the current diagnostics/problems in the workspace',
+    function(query) {
+      try {
+        var diagnostics = vscode.languages.getDiagnostics();
+        var output = '';
+        var count = 0;
+        for (var di = 0; di < diagnostics.length; di++) {
+          var entry = diagnostics[di];
+          var uri = entry[0];
+          var diags = entry[1];
+          if (!diags || diags.length === 0) continue;
+          var relUri = workspaceRoot ? pathModule.relative(workspaceRoot, uri.fsPath) : uri.fsPath;
+          for (var dj = 0; dj < diags.length && count < 30; dj++) {
+            var d = diags[dj];
+            var severity = '';
+            if (d.severity === vscode.DiagnosticSeverity.Error) severity = 'ERROR';
+            else if (d.severity === vscode.DiagnosticSeverity.Warning) severity = 'WARN';
+            else severity = 'INFO';
+            output += severity + ' ' + relUri + ':' + (d.range.start.line + 1) + '  ' + d.message + '\n';
+            count++;
+          }
+        }
+        if (!output) return { label: 'Problems', content: 'No problems found in workspace.' };
+        return { label: 'Problems (' + count + ')', content: output };
+      } catch (e) {
+        return { label: 'Problems', content: '(error: ' + e.message + ')' };
+      }
+    }
+  );
+}
+
+function resolveContextProviderMention(type, query) {
+  var provider = getContextProvider(type);
+  if (provider) {
+    return provider.handler(query);
+  }
+  return null;
+}
+
+// ─── 多模型支持 ────────────────────────────────────
+
+function getModelConfig(modelName) {
+  var cfg = vscode.workspace.getConfiguration('win7-ai-coder');
+  var provider = cfg.get('provider', 'openai');
+
+  // Override provider if model name is specific
+  if (modelName) {
+    if (modelName.indexOf('gpt-4') >= 0 || modelName.indexOf('gpt-3.5') >= 0) {
+      provider = 'openai';
+    } else if (modelName.indexOf('claude') >= 0) {
+      provider = 'anthropic';
+    } else if (modelName.indexOf('deepseek') >= 0) {
+      provider = 'deepseek';
+    } else if (modelName.indexOf('gemini') >= 0) {
+      provider = 'gemini';
+    } else if (modelName.indexOf('ollama') >= 0 || modelName.indexOf('llama') >= 0) {
+      provider = 'ollama';
+    }
+  }
+
+  // Override from settings panel
+  var settingsProvider = cfg.get('provider', 'openai');
+  if (settingsProvider && settingsProvider !== 'openai') {
+    provider = settingsProvider;
+  }
+
+  var apiKey = cfg.get('openaiApiKey', '');
+  var baseUrl = cfg.get('openaiBaseUrl', 'http://localhost:8080/v1');
+  var finalModel = modelName || cfg.get('openaiModel', 'deepseek-chat');
+
+  // Provider-specific defaults
+  if (provider === 'openai' && !modelName) {
+    baseUrl = cfg.get('openaiBaseUrl', 'https://api.openai.com/v1');
+    finalModel = cfg.get('openaiModel', 'gpt-4o-mini');
+  } else if (provider === 'deepseek') {
+    baseUrl = cfg.get('openaiBaseUrl', 'https://api.deepseek.com/v1');
+    finalModel = cfg.get('openaiModel', 'deepseek-chat');
+  } else if (provider === 'anthropic') {
+    // Anthropic uses a different API format - but we'll still use OpenAI-compatible
+    // This is a simplified approach; real Anthropic would need different handling
+    baseUrl = cfg.get('anthropicBaseUrl', 'https://api.anthropic.com/v1');
+    apiKey = cfg.get('anthropicApiKey', apiKey);
+    finalModel = cfg.get('anthropicModel', 'claude-3-5-sonnet-20240620');
+  } else if (provider === 'gemini') {
+    baseUrl = cfg.get('geminiBaseUrl', 'https://generativelanguage.googleapis.com/v1beta/openai');
+    apiKey = cfg.get('geminiApiKey', apiKey);
+    finalModel = cfg.get('geminiModel', 'gemini-2.0-flash');
+  } else if (provider === 'ollama') {
+    baseUrl = cfg.get('ollamaBaseUrl', 'http://localhost:11434/v1');
+    apiKey = cfg.get('ollamaApiKey', '');
+    finalModel = cfg.get('ollamaModel', 'llama3.2');
+  }
+
+  return {
+    provider: provider,
+    apiUrl: baseUrl.replace(/\/+$/, '') + '/chat/completions',
+    model: finalModel,
+    apiKey: apiKey,
+    maxTokens: cfg.get('maxTokens', 8192),
+    temperature: cfg.get('temperature', 0.0),
+    streaming: cfg.get('enableStreaming', true),
+    maxToolRounds: 15,
+    enableInlineCompletion: cfg.get('enableInlineCompletion', true),
+    inlineCompletionDebounce: cfg.get('inlineCompletionDebounce', 400)
+  };
+}
+
 // ─── 配置 ────────────────────────────────────────────
 
 function getConfig() {
@@ -602,6 +1149,26 @@ function toolRunTerminal(command, cwd) {
   }
 }
 
+// Helper: send agent-end with auto-save and token count
+function finishAgentLoop(panel) {
+  saveCurrentSession();
+  // Estimate token count from chat history
+  var totalChars = 0;
+  for (var i = 0; i < chatHistory.length; i++) {
+    var m = chatHistory[i];
+    if (m.content) totalChars += m.content.length;
+  }
+  var estTokens = Math.round(totalChars / 4);
+  panel.webview.postMessage({ type: 'tokenCount', count: estTokens });
+  // Context progress (rough estimate)
+  var contextPct = Math.min(1, totalChars / 64000);
+  panel.webview.postMessage({
+    type: 'status',
+    contextPercentage: contextPct,
+    isPruned: contextPct > 0.9
+  });
+}
+
 // ─── Agent Loop ──────────────────────────────────────
 
 function agentLoop(panel, userText) {
@@ -620,6 +1187,7 @@ function runLoop(panel, round) {
   var cfg = getConfig();
   if (round >= cfg.maxToolRounds) {
     panel.webview.postMessage({ type: 'error', content: 'Tool round limit reached (' + cfg.maxToolRounds + '). Please rephrase your request.' });
+    finishAgentLoop(panel);
     panel.webview.postMessage({ type: 'agent-end' });
     panel.webview.postMessage({ type: 'thinking-end' });
     return;
@@ -676,6 +1244,7 @@ function runLoop(panel, round) {
           if (em) errMsg = em;
         } catch(e) {}
         chatHistory.pop();
+        finishAgentLoop(panel);
         panel.webview.postMessage({ type: 'error', content: errMsg });
         panel.webview.postMessage({ type: 'agent-end' });
         panel.webview.postMessage({ type: 'thinking-end' });
@@ -685,6 +1254,7 @@ function runLoop(panel, round) {
       try {
         var data = JSON.parse(responseBody);
       } catch(e) {
+        finishAgentLoop(panel);
         panel.webview.postMessage({ type: 'error', content: 'JSON parse error from API' });
         panel.webview.postMessage({ type: 'agent-end' });
         panel.webview.postMessage({ type: 'thinking-end' });
@@ -693,6 +1263,7 @@ function runLoop(panel, round) {
 
       var msg = data.choices && data.choices[0] ? data.choices[0].message : null;
       if (!msg) {
+        finishAgentLoop(panel);
         panel.webview.postMessage({ type: 'error', content: 'API returned empty response' });
         panel.webview.postMessage({ type: 'agent-end' });
         panel.webview.postMessage({ type: 'thinking-end' });
@@ -724,12 +1295,14 @@ function runLoop(panel, round) {
       // Text response
       chatHistory.push({ role: 'assistant', content: msg.content || '' });
       panel.webview.postMessage({ type: 'assistant', content: msg.content || '' });
+      finishAgentLoop(panel);
       panel.webview.postMessage({ type: 'agent-end' });
       panel.webview.postMessage({ type: 'thinking-end' });
     });
   });
 
   req.on('error', function(e) {
+    finishAgentLoop(panel);
     panel.webview.postMessage({ type: 'error', content: 'Connection error: ' + e.message });
     panel.webview.postMessage({ type: 'agent-end' });
     panel.webview.postMessage({ type: 'thinking-end' });
@@ -980,8 +1553,11 @@ function handleWebviewMessage(panel, message) {
       handleRunCommand(panel, message);
       break;
     case 'clear':
+      saveCurrentSession();
       chatHistory = [];
+      currentSessionId = null;
       panel.webview.postMessage({ type: 'cleared' });
+      sendSessionsList(panel);
       break;
     case 'ready':
       var cfg = getConfig();
@@ -991,9 +1567,64 @@ function handleWebviewMessage(panel, message) {
         ws: workspaceRoot || '(no workspace)',
         inlineComplete: cfg.enableInlineCompletion
       });
+      // Send current sessions list on ready
+      sendSessionsList(panel);
       break;
     case 'attachFile':
       attachCurrentFile(panel);
+      break;
+    // ─── Settings ───
+    case 'updateConfig':
+      handleSaveSettings(panel, message);
+      break;
+    case 'loadSettings':
+      handleLoadSettings(panel);
+      break;
+    // ─── Session History ───
+    case 'newSession':
+      handleNewSession(panel);
+      break;
+    case 'loadSession':
+      handleLoadSession(panel, message);
+      break;
+    case 'clearSessions':
+      handleClearSessions(panel);
+      break;
+    case 'deleteSession':
+      handleDeleteSession(panel, message);
+      break;
+    // ─── Diff ───
+    case 'acceptDiff':
+      handleAcceptDiff(panel, message);
+      break;
+    case 'rejectDiff':
+      handleRejectDiff(panel, message);
+      break;
+    // ─── Context Provider ───
+    case 'getContextProviders':
+      panel.webview.postMessage({
+        type: 'contextProviders',
+        providers: getAllContextProviders().map(function(p) {
+          return { name: p.name, displayName: p.displayName, description: p.description };
+        })
+      });
+      break;
+    case 'resolveContextProvider':
+      var providerName = message.providerName;
+      var query = message.query || '';
+      var result = resolveContextProviderMention(providerName, query);
+      panel.webview.postMessage({
+        type: 'contextProviderResult',
+        providerName: providerName,
+        result: result
+      });
+      break;
+    // ─── Rebuild Index ───
+    case 'rebuildIndex':
+      saveCodebaseIndex();
+      if (chatPanel) {
+        chatPanel.webview.postMessage({ type: 'status', text: 'Index rebuilt: ' + Object.keys(codebaseIndex.files).length + ' files' });
+      }
       break;
   }
 }
@@ -1017,6 +1648,19 @@ function handleResolveMention(panel, message) {
     resolveCodebaseMention(panel, query);
   } else if (type === 'terminal') {
     resolveTerminalMention(panel, query);
+  } else {
+    // Try context providers
+    var providerResult = resolveContextProviderMention(type, query);
+    if (providerResult) {
+      panel.webview.postMessage({
+        type: 'mentionResolved',
+        key: type + ':' + query,
+        label: providerResult.label,
+        content: providerResult.content
+      });
+    } else {
+      panel.webview.postMessage({ type: 'mentionResult', results: [] });
+    }
   }
 }
 
@@ -1330,6 +1974,12 @@ function resolveSingleMention(type, query) {
     }
   }
 
+  // Check registered context providers
+  var providerResult = resolveContextProviderMention(type, query);
+  if (providerResult) {
+    return providerResult;
+  }
+
   return null;
 }
 
@@ -1577,6 +2227,12 @@ function activate(context) {
     workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
   }
 
+  // Initialize context providers (Continue-style)
+  initContextProviders();
+
+  // Load sessions from storage
+  loadSessionsFromStorage();
+
   // Phase 3: Build codebase index on activation
   if (workspaceRoot) {
     var loaded = loadCodebaseIndex();
@@ -1743,6 +2399,8 @@ function openChatPanel(context) {
     handleWebviewMessage(chatPanel, msg);
   });
   chatPanel.onDidDispose(function() {
+    // Save current session when panel closes
+    saveCurrentSession();
     chatPanel = null;
   });
 
@@ -1750,6 +2408,7 @@ function openChatPanel(context) {
 }
 
 function deactivate() {
+  saveCurrentSession();
   chatPanel = null;
   chatHistory = [];
 }
